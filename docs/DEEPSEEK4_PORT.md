@@ -1,25 +1,118 @@
 # Porting the DeepSeek engine to DeepSeek-V4-Flash-0731 (`deepseek4`)
 
-**Status: not usable yet — it loads and decodes, with the wrong math.** Measured on 2026-10-24, RX 9070 XT (16 GiB,
-gfx1201), 125 GiB RAM, one NVMe, the Qwen server stopped: a pack of the IQ2_XXS set (91 GB of weights) loads in
-12.6 s, 765 of 11,008 experts go to VRAM and the rest read in place from the files, and a 3-token prompt decodes at
-2.2 tokens/s (1.4 GB read from disk a token; no expert profile, cold store). The tokens are wrong, as expected: two
-test-only substitutions were needed to get this far (below), and the four features in this note are still missing.
+Status: **experimental, not usable.** The packer accepts the model, the engine loads it, and it decodes — with the
+wrong math, because two of the model's four differences are still missing. This note is the restart point: what is
+done, what is left, and how to build and run it.
 
-The two substitutions in the test pack (never in a real one): layer 26's and layer 42's down experts are MXFP4 in
-this quant and the engine cannot mix MXFP4 with the I-quants, so `tensors.txt` points them at layer 25's and layer
-41's down (same shape, wrong values); and the ratio-4 compressor matrices were cut to their first 512 rows (the engine
-expects `head` rows, the model has `2·head`). Both are undone by the real port.
+## Where this stands
 
-DeepSeek-V4-Flash-0731 (`deepseek4`, 43 layers, 256 experts, no Engram) carries four pieces of the model the engine
-(`deepseek41`, 40 layers, 384 experts, an Engram table) has no code for. They are listed below with the reference
-needed to write them.
+Branch `f-dsv41-ds4`, worktree `/mnt/nvme_lexar_0/ollama/.local/share/opencode/worktree/cfd61a/f-dsv41-ds4`:
 
-The reference implementation is llama.cpp's `src/models/deepseek4.cpp` in the pinned checkout
-(`third_party/llama.cpp`, the one the CUDA/HIP builds use). It reads the same GGUFs and was checked against the same
-model, so its math is the target. Nothing in this note is measured on a card yet.
+| commit | what |
+|---|---|
+| `335fcfa1` | the packer accepts `deepseek4`; the engine loads and decodes a pack (test rewrites, below) |
+| `f66aafa4` | the head hyper-connection and the hash layers' routing |
 
-## What the model is
+Measured 2026-10-24, RX 9070 XT (16 GiB, gfx1201), 125 GiB RAM, one NVMe, the Qwen server stopped, the test pack
+(no expert profile, cold store): dense weights 6.7 s, whole load 12.6 s, 763 of 11,008 experts in VRAM (6.1 GB), the
+rest read in place from the files; a 3-token prompt in 2.24 s, then 2.27 tokens/s decoding, 1.33 GB read from the
+disk a token. Output is wrong: the compressor and the indexer below are not written.
+
+Everything below marked *static* is read from the code, not measured on a card.
+
+## Restart: build and run
+
+```sh
+# build (the ROCm SDK the Qwen build uses, gfx1201)
+cd /mnt/nvme_lexar_0/ollama/.local/share/opencode/worktree/cfd61a/f-dsv41-ds4
+V=/mnt/nvme_lexar_0/ollama/build/Strata-0.1.40.3/.venv/lib/python3.14/site-packages
+cmake -G Ninja -S . -B /mnt/nvme_lexar_0/ollama_user_cache/strata/build-dsv41 \
+  -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON -DSTRATA_BUILD_DSV41=ON -DSTRATA_BUILD_TESTS=OFF \
+  -DCMAKE_HIP_ARCHITECTURES=gfx1201 -DCMAKE_HIP_COMPILER=$V/_rocm_sdk_devel/llvm/bin/clang++ \
+  -DCMAKE_HIP_COMPILER_ROCM_ROOT=$V/_rocm_sdk_devel \
+  -DCMAKE_HIP_FLAGS="--rocm-path=$V/_rocm_sdk_devel --rocm-device-lib-path=$V/_rocm_sdk_devel/lib/llvm/amdgcn/bitcode" \
+  -DCMAKE_PREFIX_PATH="$V/_rocm_sdk_devel;$V/_rocm_sdk_libraries_gfx120X_all" \
+  -DSTRATA_GGML_DIR=/mnt/nvme_lexar_0/ollama/build/Strata-0.1.40.3/third_party/llama.cpp \
+  -DSTRATA_NATIVE_EXPERTS=ON
+HIP_PLATFORM=amd ninja -j 12 -C /mnt/nvme_lexar_0/ollama_user_cache/strata/build-dsv41 strata-dsv41
+
+# the pack (3 MB of metadata; the 91 GB of weights stay where they are)
+python3 tools/dsv41/pack_gguf.py \
+  --model /home/ollama/.cache/huggingface/hub/models--unsloth--DeepSeek-V4-Flash-0731-GGUF/snapshots/fbbb5b93fb787c21338159b0af3318bb3f4d9768/UD-IQ2_XXS \
+  --out /mnt/nvme_lexar_0/ollama_user_cache/strata/ds4-pack
+python3 tools/dsv41/ds4_testpack.py /mnt/nvme_lexar_0/ollama_user_cache/strata/ds4-pack \
+  /mnt/nvme_lexar_0/ollama_user_cache/strata/ds4-pack-test      # TEST ONLY, see below
+
+# run (the GPU must be free: stop the Qwen server first)
+export LD_LIBRARY_PATH=$V/_rocm_sdk_devel/lib:$V/_rocm_sdk_devel/lib/rocm_sysdeps/lib:$V/_rocm_sdk_libraries_gfx120X_all/lib
+/mnt/nvme_lexar_0/ollama_user_cache/strata/build-dsv41/strata-dsv41 \
+  --pack /mnt/nvme_lexar_0/ollama_user_cache/strata/ds4-pack-test \
+  --ids 100,200,300 --n 4 --max-context 8192 --reserve-mib 1024 \
+  --expert-profile none --dspark none --cpu-threads 24
+```
+
+`--pack-info` prints the pack without touching a card. `--dump-logits FILE` and `--score FILE --score-out FILE` are
+the comparison hooks for the validation step.
+
+## To do
+
+- [ ] **1. The compressor: CSA (ratio 4) and HCA (ratio 128), with the position table.**
+  - `src/dsv41/ds4_kernels.cu`: `compress_kernel` / `compress_win`; `src/dsv41/ds4_kernels.cuh`.
+  - `src/dsv41/ds4_model.cu`: `Layer::c_kv`, `c_score`, `latent`; the compressor loads in `load_dense`; the calls at
+    the window path (`compress_win(...)`, one near line 6733) and the decode path (near 8611); `Src`/`cp_latent`.
+  - `coff = ratio == 4 ? 2 : 1`: `wkv`/`wgate` are `[dim, coff·head]`; `ape` is `[coff·head, ratio]`.
+  - score = `wgate(x) + ape[slot]`, slot = position in the group; softmax over the group's `2·ratio` (CSA) or
+    `ratio` (HCA) scores; weighted sum of the corresponding `head` values; RMS norm (`attn_compressor_norm`); RoPE
+    at the compressed positions with `compress_rope_freq_base` (160000).
+  - The ratio-4 state keeps `2·head` a token. A block b (tokens 4b … 4b+3) mixes the **first half** of the previous
+    block's four tokens with the **second half** of its own four tokens (llama.cpp's “overlap” compressor; the state
+    plan is in `llama-kv-cache-dsv4.cpp`, `dsv4_state_read_idxs()`, and the graph in
+    `build_overlap_compressed_kv_from_state`).
+  - *Static.* Reusing `Src` one source a layer (every ratio>0 layer is already one) should keep the per-layer
+    ownership; the kernel and the buffer widths are the work.
+  - Done when: a short prompt's compressed rows match llama.cpp's, and the removed compressor slice in
+    `ds4_testpack.py` no longer changes the tokens.
+
+- [ ] **2. The indexer's own compressor (LID), 21 ratio-4 layers.**
+  - Tensors already mapped: `attn.indexer.compressor.{wkv,wgate,ape,norm}` (`[dim, 2·128]`, `[256, 4]`, `[128]`).
+  - It is the CSA algorithm at `index_head_dim` 128: compressed 128-wide keys, then the existing query path
+    (`indexer.wq_b` on the q-lora vector, `indexer.proj` weights, top-512 over the compressed rows).
+  - `src/dsv41/ds4_model.cu` indexer block in `load_dense` and the attention path; `pack_gguf.py` must then write
+    `index_source_layer_ids` = the 21 layers (it leaves it empty today on purpose, so the compressed rows are read
+    without an index selection).
+  - Open question (*static*): llama.cpp multiplies the indexer q/k by a Hadamard matrix (`inp_lid.k_rot`,
+    `llama_mul_mat_hadamard`) when its KV cache is quantised. The engine's cache is its own FP4 format; decide
+    whether the rotation belongs to the model or only to llama.cpp's cache quantisation before copying it.
+
+- [ ] **3. MXFP4 mixed with the I-quants (the real pack has it).**
+  - Layers 26 and 42 of UD-IQ2_XXS have MXFP4 down experts; `expert_layout_mx` rejects MXFP4 beside IQ gate/up.
+  - Either read each role with its own kernels (the `ds4_gguf.cu` path branches on `mx_experts(lay)`, all three
+    roles MXFP4, so this means a per-role dispatch in the CPU lane and the GPU windows), or requantise those two
+    down tensors in the packer.
+  - Done when `ds4_testpack.py`'s down substitution is not needed.
+
+- [ ] **4. Validation against llama.cpp.**
+  - A fixed token sequence, `--dump-logits` from the engine, llama.cpp's logits for the same ids (the pinned
+    checkout has `models/deepseek4.cpp`; build `llama-cli`/`llama-perplexity` from it or use the binary the GGUF was
+    tested with).
+  - Compare the first tokens' logits layer by layer if possible (`--dump-logits` is final only; a per-layer tap may
+    need a debug hook).
+  - Then 8K context, then speed with an expert profile (`tools/dsv41` has the profile tools; the shipped
+    `profile-2.00.bin` is for the IST-DAS sets, not this model).
+
+- [ ] **5. Not started, after the engine matches:** the model in `setup.py`/`strata_control` (family, pin, sizes),
+  the server hand-off, and a `strata-dsv41` package for the feed.
+
+## Test-only rewrites in `ds4_testpack.py` (remove when 1 and 3 land)
+
+1. layers 26 and 42's down experts point at layer 25's / 41's (same shape, wrong values): the engine cannot mix
+   MXFP4 with the I-quants.
+2. the ratio-4 compressor matrices are cut to their first 512 rows: the engine's compressor reads `head`, the model
+   stores `2·head`.
+
+Both are in `tensors.txt` only; the weights are not touched. A real pack must never be built this way.
+
+## The model
 
 From the GGUF's own metadata (`UD-IQ2_XXS`, 3 shards, 90.9 GB of weights + a 10.9 GB DSpark drafter):
 
@@ -29,102 +122,79 @@ From the GGUF's own metadata (`UD-IQ2_XXS`, 3 shards, 90.9 GB of weights + a 10.
 | layers | 43 |
 | experts | 256 routed, 6 a token, 1 shared; `hash_layer_count` 3 |
 | hidden / heads | 4096 / 64, head 512, rope 64, q_lora 1024, o_lora 1024 × 8 groups |
-| hyper-connections | 4 (the layer `hc_*` tensors the engine already reads) |
+| hyper-connections | 4 (`hc_*` per layer; the engine already reads them) |
 | compress ratios | `0,0,4,128,4,128,…,4` (43 entries), then 3 more for the drafter |
 | indexer | 64 heads × 128, top-k 512, on the 21 ratio-4 layers |
-| context | 1,048,576 (the engine would be checked at 8192, as for V4.1) |
-| quant | UD-IQ2_XXS: IQ2_XXS / IQ3_XXS experts, one layer IQ2_S + MXFP4, Q4–Q6_K dense |
+| context | 1,048,576 (the engine is checked at 8192, as V4.1 is) |
+| quant | UD-IQ2_XXS: IQ2_XXS/IQ3_XXS experts, layer 26 IQ2_S + MXFP4, Q4–Q6_K dense |
 
-The engine's `ds4.txt` already carries all of that after `tools/dsv41/pack_gguf.py` translates the `deepseek4.*` keys
-(the packer now does; see “packer changes”).
+The engine implements DeepSeek-V4.1-Flash (`deepseek41`: 40 layers, 384 experts, an Engram n-gram table). The packer
+translates the `deepseek4.*` keys to the `ds4.txt` the engine reads; the geometry (layers, experts, ratios, heads)
+arrives correctly — that is why the model loads.
 
-## The four missing pieces
+## The four differences, in full
 
-### 1. The compressor is per layer, with a learned position table
+### 1. Compressor: per layer, with the learned position table, and CSA's overlap
 
-V4.1: a few “source” layers own the compressed KV of a ratio, and the layers after them read it. The engine's
+V4.1: a few source layers own the compressed KV of a ratio; the following layers read it. The engine's
 `kv_source_layer_ids` model.
 
-V4.1-Flash-0731: **every** layer with `ratio > 0` carries `attn_compressor_kv/gate/norm/ape` and owns its own
-compressed rows. The packer therefore writes `kv_source_layer_ids = [2..42]`, one source a layer.
+V4-Flash: every layer with `ratio > 0` has its own `attn_compressor_kv/gate/norm/ape`. The packer writes
+`kv_source_layer_ids = [2..42]`.
 
-Two shapes, taken from llama.cpp (`coff = ratio == 4 ? 2 : 1`):
+- **ratio 128 (HCA)**: `wkv`/`wgate` `[4096, 512]`, `ape` `[512, 128]`. A block of 128 tokens: softmax over its 128
+  scores (each `wgate(x) + ape[slot]`), weighted sum of the 128 `head`-wide values, RMS norm, RoPE.
+  llama.cpp: `build_hca_compressed_kv_from_state`.
+- **ratio 4 (CSA)**: `wkv`/`wgate` `[4096, 1024]`, `ape` `[1024, 4]`. A block of four tokens mixes eight values:
+  the previous block's four tokens' first half and its own four tokens' second half, with the eight scores
+  (softmax), sum to one `head` vector, RMS norm, RoPE. llama.cpp: `build_overlap_compressed_kv_from_state`, and the
+  index plan in `dsv4_state_read_idxs` (`src/llama-kv-cache-dsv4.cpp`).
 
-- **ratio 4 (CSA)**: `wkv`/`wgate` are `[dim, 2·head]` = `[4096, 1024]`; `ape` is `[2·head, 4]` = `[1024, 4]`.
-- **ratio 128 (HCA)**: `wkv`/`wgate` are `[dim, head]` = `[4096, 512]`; `ape` is `[head, 128]` = `[512, 128]`.
+The engine's `compress_win` does a softmax over `ratio` rows of `head` values with no position table, and its state
+is `ratio·head`; CSA needs `2·head` a token both in the state and in `ape`.
 
-The compressor's score is `wgate(x) + ape[slot]`, where `slot` is the position inside the group (0 … ratio-1). Then,
-for each group, softmax over the `coff · ratio` scores and a weighted sum of the `coff · ratio` values, each `head`
-wide; RMS norm with `attn_compressor_norm`; RoPE at the compressed positions with `compress_rope_freq_base`
-(160000). See `build_overlap_compressed_kv_from_state` (ratio 4) and `build_hca_compressed_kv_from_state`
-(ratio 128).
+### 2. Indexer: it compresses its own keys
 
-The engine's `compress_win` (`src/dsv41/ds4_kernels.cu:1946`) does the softmax and the weighted sum over `ratio`
-rows of `head` values and has no position table, and its per-layer state (`Layer::c_kv`, `c_score`) is `ratio · head`
-floats. The ratio-4 layers need `2 · ratio · head`, and the kernel needs the APE add.
+V4.1: `indexer.wk` projects the main compressed rows into index keys.
 
-### 2. The indexer compresses its own keys
+V4-Flash: 21 ratio-4 layers carry `indexer_compressor_{ape,kv,gate,norm}` — the same CSA algorithm at 128 wide —
+and those compressed rows are the keys; `indexer.attn_k` does not exist. The candidate-block step
+(`cand_src`/`uses_cand`) does not exist either.
 
-V4.1: the indexer projects the main compressed rows with `indexer.wk` into index keys (`i_wk` on the latent), and an
-optional candidate-block step picks blocks.
+### 3. The first three layers route by token id — **done**
 
-V4-Flash: the 21 ratio-4 layers carry `indexer_compressor_ape/kv/gate/norm` — a second compressor at 128 wide
-(`wkv`/`wgate` `[4096, 256]`, `ape` `[256, 4]`, `norm` `[128]`) — and the indexer's keys are those compressed rows.
-`indexer_compressor_norm` is 128 wide (the engine's index head dim is also 128). The query path is as now:
-`indexer.attn_q_b` on the q-lora vector, RoPE, `indexer.proj` weights, top-k 512.
+`ffn_gate_tid2eid` (I32 `[6, 129280]`) on layers 0–2: the experts are `table[token]`, the weights the gate's scores
+at them, no router bias. The packer carries it (`layers.N.ffn.gate.tid2eid`), the engine uploads the window's ids
+(`Dev::tids`) and `route(..., tids, tid2eid)` takes them. `ffn.gate.bias` is zero on these layers (the engine now
+makes a zero bias where the model has none).
 
-So `attn.indexer.wk` and `attn.indexer.k_norm` do not exist in this model; the keys come from a compressor of their
-own. See `build_lid_top_k` and the `lid_state_*` path in `build_attention`.
+### 4. The head's hyper-connection — **done**
 
-### 3. The first three layers route by token id
-
-`hash_layer_count = 3`, and layers 0–2 carry `ffn_gate_tid2eid.weight`, an **I32** table `[6, 129280]`: for a token
-id, the six experts it uses. llama.cpp uses it instead of the top-k of the gate:
-
-```cpp
-selected_experts = ggml_get_rows(ctx0, layer.ffn_gate_tid2eid, res->t_inp_tokens);
-exp_probs_b = nullptr;                 // no learned router bias on these layers
-```
-
-The weights are still the gate's scores at those six experts. The engine's `route()` always takes the top-k of
-`gate + bias` (`src/dsv41/ds4_kernels.cu:458`); the table is skipped by the packer today (ggml type 26 is I32, and
-`pack_gguf.py` leaves non-weight types out).
-
-The engine also requires `ffn.gate.bias` on every layer; the three hash layers have none. `load_dense` now makes a
-zero bias instead (zeros route exactly like “no bias”).
-
-### 4. The head mixes the hyper-connections once more
-
-`output_hc_fn` `[4·dim, 4]`, `output_hc_base` `[4]`, `output_hc_scale` `[1]`: flatten the 4 states to `4·dim`, RMS
-norm, one linear to 4 values, `sigmoid(scale·mix + base) + eps`, weighted sum over the 4 states, then `output_norm`
-and the head. llama.cpp: `build_hc_head`. The engine applies hyper-connections only inside layers
-(`hc_mix_chunk` / `hc_split` / `hc_post`); at the head it goes straight to `norm.weight` and `head`.
+`output_hc_fn` `[4·dim, 4]`, `base` `[4]`, `scale` `[1]`: flatten the four states, RMS norm, one linear to four
+values, `sigmoid(scale·mix + base) + eps`, weighted sum, then `output_norm` and the head. `head_pre()` + the
+`head_hc_pre` kernel, at all three head paths.
 
 ## Packer changes (done)
 
 `tools/dsv41/pack_gguf.py`:
 
-- accepts `deepseek4` as a model architecture (`MODEL_ARCHS`);
-- maps the new tensors: `attn.compressor.ape`, `attn.indexer.compressor.{ape,wkv,wgate,norm}`, `head.hc_*`, and
-  carries `ffn.gate.tid2eid` as an I32 table (`layers.N.ffn.gate.tid2eid`);
+- accepts `deepseek4` (`MODEL_ARCHS`);
+- maps `attn.compressor.ape`, `attn.indexer.compressor.{ape,wkv,wgate,norm}`, `head.hc_*`;
+- carries `ffn_gate_tid2eid` as I32 (`layers.N.ffn.gate.tid2eid`) and `hash_layer_count`;
 - writes a header-only `engram.bin` when the model has no Engram (the engine opens it unconditionally);
-- takes the tokenizer's `pre` from the GGUF (`joyai-llm`) instead of assuming `deepseek3`;
-- synthesises `kv_source_layer_ids` (every ratio>0 layer) and leaves `index_source_layer_ids` empty (the old
-  `indexer.attn_k` is absent; see piece 2).
+- takes the tokenizer `pre` from the GGUF (`joyai-llm`) instead of assuming `deepseek3`;
+- writes `kv_source_layer_ids` for every ratio>0 layer, and leaves `index_source_layer_ids` empty until item 2.
 
-A pack of the 0731 IQ2_XXS set: `strata-dsv41 --pack-info` reports 43 layers × 256 experts, 6 used; experts
-IQ2_XXS/IQ2_S/MXFP4 per layer.
+## What the engine does with the pack today
 
-## What the engine still needs
+`strata-dsv41` reads `ds4.txt` + `tensors.txt`, places the dense weights and as many experts as VRAM holds, reads
+the rest in place from the GGUF, and runs the V4.1 graph: window + compressor + (no) indexer attention, hyper-
+connections per layer, MoE with top-k or the hash table, and the head with its hyper-connection. Because the
+compressor widths and the position table are V4.1's, every layer with `ratio > 0` is numerically wrong; the output
+cannot be compared with llama.cpp until item 1 lands.
 
-| Where | What |
-|---|---|
-| `ds4_kernels.cu` `compress_win` / `compress_kernel` | **not written**: `coff` (2 for ratio 4), the `ape` add by slot, and the 2-row overlap the ratio-4 groups use |
-| `ds4_model.cu` `Src` / `Layer::c_kv`, `c_score`, `latent` | **not written**: ratio-4 rows at `2·head`; the compressed state stays per layer (already the case when each ratio>0 layer is a source) |
-| `ds4_model.cu` indexer | **not written**: a second compressor (128 wide) and its keys, replacing `indexer.wk` on these layers |
-| `route()` / `moe_route` | **done**: experts from `tid2eid[token]` on layers 0–2, the gate's weights at those ids (`route(..., tids, tid2eid)`) |
-| head | **done**: `head_pre()` runs the `output_hc_*` mix (`hc_mix` + `head_hc_pre`) before `norm.weight` |
-| `pack_gguf.py` + engine | **done**: the I32 `ffn_gate_tid2eid` table is carried and uploaded per hash layer |
+## Cautions
 
-Until all four are in, a pack of this model loads but cannot answer correctly: the compressed rows, the attention
-selection and three layers' experts would be wrong.
+- The engine package for the feed (`strata-dsv41-…tar.gz`) does not exist for this model; this is a source build.
+- `strata launch`/`setup.py` do not know the model yet (item 5). They still serve V4.1 only.
+- The test rewrites change values, not shapes: never ship such a pack.
