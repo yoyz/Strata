@@ -1392,7 +1392,8 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                                                             float route_scale, const unsigned long long* __restrict__ vram,
                                                             const float* __restrict__ x, int dim, int* idx, float* w,
                                                             unsigned long long* plan_ptr, Req* req,
-                                                            const float* __restrict__ bias_vl, unsigned vl) {
+                                                            const float* __restrict__ bias_vl, unsigned vl,
+                                                            const int* __restrict__ tids, const int* __restrict__ tid2eid) {
     __shared__ float sc[1024], bs[1024];
     __shared__ float bv[32];
     __shared__ int bi[32];
@@ -1409,6 +1410,10 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
     }
     __syncthreads();
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+    if (tid2eid != nullptr) {   // (deepseek4's hash layers: the token's experts, the gate's scores at them)
+        if (threadIdx.x < k) pick[threadIdx.x] = __ldg(tid2eid + (size_t) __ldg(tids + t) * k + threadIdx.x);
+        __syncthreads();
+    } else
     for (int r = 0; r < k; ++r) {
         float best = -FLT_MAX;
         int bix = 0x7fffffff;
@@ -1862,9 +1867,9 @@ attnsplit::AttnSplitScratch split_scratch(cudaStream_t s, int heads) {
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl,
-                   unsigned vl, int na0, int na1) {
+                   unsigned vl, int na0, int na1, const int* tids, const int* tid2eid) {
     route_publish_kernel<<<T, 512, 0, s>>>(logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
-                                           vl != 0 ? bias_vl : nullptr, vl);
+                                           vl != 0 ? bias_vl : nullptr, vl, tids, tid2eid);
     if (req != nullptr) publish_kernel<<<1, 1, 0, s>>>(req, T, seq, na0, na1);
 }
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s) {

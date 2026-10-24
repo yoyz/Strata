@@ -1017,8 +1017,10 @@ size_t row_stride(const x3::Mat& m) {   // values (BF16) or bytes (MXFP4, Q8_0, 
            : m.fmt == kFmtGG   ? type_row_bytes(m.K, m.k)
                                : (size_t) m.k;
 }
-// a layer's low-bit experts as ds4_iq's arguments (false: its types not covered - printed)
-bool iq_args(const x3::ExpertLayout& lay, int n_embd, int n_ff, float limit, iq::Args& ia, const char* who) {
+// a layer's low-bit experts as ds4_iq's arguments (false: its types not covered - printed).  A stage that is not asked
+// for may be MXFP4: a mixed layer (mx_gate_up / mx_down) hands each stage to the family its roles name.
+bool iq_args(const x3::ExpertLayout& lay, int n_embd, int n_ff, float limit, iq::Args& ia, const char* who,
+             bool need_gu = true, bool need_down = true) {
     ia = iq::Args{};
     for (int r = 0; r < 3; ++r) ia.tr[r] = lay.trellis[r];
     ia.n_embd = n_embd;
@@ -1026,8 +1028,8 @@ bool iq_args(const x3::ExpertLayout& lay, int n_embd, int n_ff, float limit, iq:
     ia.limit = limit;
     ia.tg = expert_type(lay, 0);
     ia.td = expert_type(lay, 2);
-    if (ia.tg != expert_type(lay, 1) || !iq::supported(ia.tg) || !iq::supported(ia.td) || n_embd % iq::block_values(ia.tg) != 0 ||
-        n_ff % iq::block_values(ia.td) != 0) {
+    if (ia.tg != expert_type(lay, 1) || (need_gu && (!iq::supported(ia.tg) || n_embd % iq::block_values(ia.tg) != 0)) ||
+        (need_down && (!iq::supported(ia.td) || n_ff % iq::block_values(ia.td) != 0))) {
         std::fprintf(stderr, "ds4 gguf %s: expert types %s / %s / %s (n_embd %d, n_ff %d) not covered\n", who,
                      type_name(expert_type(lay, 0)), type_name(expert_type(lay, 1)), type_name(expert_type(lay, 2)),
                      n_embd, n_ff);
@@ -1208,9 +1210,9 @@ void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s)
     if (!mx_geometry("moe_gate_up", a.k, a.n_embd, a.n_ff) || h == nullptr) return;
     Scratch* sc = scratch(s);
     if (sc == nullptr) return;
-    if (!mx_experts(a.lay)) {   // low-bit experts: ds4_iq's kernels
+    if (!mx_gate_up(a.lay)) {   // low-bit gate/up: ds4_iq's kernels (the down may be MXFP4)
         iq::Args ia;
-        if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "moe_gate_up")) return;
+        if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "moe_gate_up", true, false)) return;
         ia.plan_ptr = a.plan_ptr;
         ia.h = h;
         ia.xq = sc->xq;
@@ -1242,9 +1244,9 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
     m.hq = sc->hq;
     m.hd = sc->hd;
     q8_quant(h, (size_t) a.n_ff, a.k, a.n_ff, sc->hq, sc->hd, s);
-    if (!mx_experts(a.lay)) {   // low-bit experts: ds4_iq's down, then the same combine
+    if (!mx_down(a.lay)) {   // low-bit down: ds4_iq's kernels (the gate/up may be MXFP4), then the same combine
         iq::Args ia;
-        if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "moe_down")) return;
+        if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "moe_down", false, true)) return;
         ia.plan_ptr = a.plan_ptr;
         ia.part = sc->part;
         ia.hq = sc->hq;
@@ -1291,10 +1293,10 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
     m.hq = sc->hq;
     m.hd = sc->hd;
     const int groups = a.T * a.k;   // at most (the blocks past the real count return at once)
-    const bool mx = mx_experts(a.lay);
+    const bool mx_gu = mx_gate_up(a.lay), mx_d = mx_down(a.lay);
     iq::Args ia;
-    if (!mx) {   // low-bit experts: ds4_iq's kernels on the same groups and scratch
-        if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "win_experts")) return false;
+    if (!mx_gu || !mx_d) {   // low-bit stages: ds4_iq's kernels on the same groups and scratch
+        if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "win_experts", !mx_gu, !mx_d)) return false;
         ia.grp_ptr = a.grp_ptr;
         ia.grp_start = a.grp_start;
         ia.grp_ent = a.grp_ent;
@@ -1307,10 +1309,10 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
         ia.hd = sc->hd;
     }
     q8_quant(a.x, a.x_stride, a.T, a.n_embd, sc->xq, sc->xd, s);
-    if (mx) launch_groups<GateUpK>(m, a.n_ff, groups, a.T, s);
+    if (mx_gu) launch_groups<GateUpK>(m, a.n_ff, groups, a.T, s);
     else iq::gate_up(ia, groups, a.T, s);
     q8_quant(a.h, (size_t) a.n_ff, a.T * 8, a.n_ff, sc->hq, sc->hd, s);   // (rows of picks not on the device: unused)
-    if (mx) launch_groups<DownK>(m, a.n_embd, groups, a.T, s);
+    if (mx_d) launch_groups<DownK>(m, a.n_embd, groups, a.T, s);
     else iq::down(ia, groups, a.T, s);
     if (a.wait_ptr != nullptr) mx_wait_kernel<<<1, 32, 0, s>>>(a.wait_ptr, a.wait_val);
     CombArgs c{};
@@ -1351,9 +1353,9 @@ void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_
                  cudaStream_t s) {
     if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
     if (!mx_geometry("set_gate_up", 1, sa.n_embd, sa.n_ff)) return;
-    if (!mx_experts(sa.lay)) {   // low-bit experts: ds4_iq's sets
+    if (!mx_gate_up(sa.lay)) {   // low-bit gate/up: ds4_iq's sets (the down may be MXFP4)
         iq::Args ia;
-        if (!iq_args(sa.lay, sa.n_embd, sa.n_ff, sa.limit, ia, "set_gate_up")) return;
+        if (!iq_args(sa.lay, sa.n_embd, sa.n_ff, sa.limit, ia, "set_gate_up", true, false)) return;
         iq::SetArgs q = iq_set(sa);
         q.xf = x;
         q.idx = row_idx;
@@ -1412,9 +1414,9 @@ void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_
 void set_down(const x3::SetArgs& sa, const uint16_t* h16, int ldh, float* y, int ldy, cudaStream_t s) {
     if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
     if (!mx_geometry("set_down", 1, sa.n_embd, sa.n_ff)) return;
-    if (!mx_experts(sa.lay)) {   // low-bit experts: ds4_iq's sets
+    if (!mx_down(sa.lay)) {   // low-bit down: ds4_iq's sets (the gate/up may be MXFP4)
         iq::Args ia;
-        if (!iq_args(sa.lay, sa.n_embd, sa.n_ff, sa.limit, ia, "set_down")) return;
+        if (!iq_args(sa.lay, sa.n_embd, sa.n_ff, sa.limit, ia, "set_down", false, true)) return;
         iq::SetArgs q = iq_set(sa);
         q.xh = h16;
         q.ldx = ldh;

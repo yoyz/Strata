@@ -1176,6 +1176,13 @@ struct Model::Impl {
     int xin_n = std::getenv("DS4_XIN_N") ? std::atoi(std::getenv("DS4_XIN_N")) : 1024;
     std::array<int, 64> xin_got{};
     std::FILE* trace_f = std::getenv("DS4_TRACE") != nullptr ? std::fopen(std::getenv("DS4_TRACE"), "wb") : nullptr;
+    // DS4_DUMP_ATTN=<layer>:<file>: (debug) one layer's attention output (after wo_b, before hc_post), T x dim floats a window
+    int attn_dump_layer = std::getenv("DS4_DUMP_ATTN") ? std::atoi(std::getenv("DS4_DUMP_ATTN")) : -1;
+    std::FILE* attn_dump_f = [] {
+        const char* v = std::getenv("DS4_DUMP_ATTN");
+        const char* f = v != nullptr ? std::strchr(v, ':') : nullptr;
+        return f != nullptr ? std::fopen(f + 1, "wb") : nullptr;
+    }();
     struct ProfMark {
         const Dev* d;
         cudaEvent_t ev;
@@ -1696,11 +1703,11 @@ struct Model::Impl {
             off += align256(bytes) + (store_gb() > 0 ? ExpertStore::kSlack : 0);   // (the store's aligned reads spill into the gaps)
         }
         l.lay.fmt = gg::kFmtMXFP4;
-        if (!gg::mx_experts(l.lay) && (gg::expert_type(l.lay, 0) != gg::expert_type(l.lay, 1) ||
-                                       gg::expert_type(l.lay, 0) == gg::kTypeMXFP4 ||
-                                       gg::expert_type(l.lay, 2) == gg::kTypeMXFP4)) {
+        // gate and up must be one type; the down may be MXFP4 beside i-quant gate/up (unsloth's UD-IQ2_XXS, layers 26
+        // and 42) - each stage then goes to its own family (gg::mx_gate_up / mx_down)
+        if (gg::expert_type(l.lay, 0) != gg::expert_type(l.lay, 1)) {
             err = P + ": gate / up / down of types " + gg::type_name(l.lay.K[0]) + " / " + gg::type_name(l.lay.K[1]) +
-                  " / " + gg::type_name(l.lay.K[2]) + " (gate and up must match; MXFP4 does not mix with the others)";
+                  " / " + gg::type_name(l.lay.K[2]) + " (gate and up must match)";
             return false;
         }
         l.blob = off;
@@ -3693,6 +3700,12 @@ struct Model::Impl {
                     if (!dalloc(d, l.tid2eid, tt->bytes / 4, err, acct)) return false;
                     cudaSetDevice(d.id);
                     CK(cudaMemcpyAsync(l.tid2eid, raw.data(), tt->bytes, cudaMemcpyHostToDevice, d.st));
+                    if (std::getenv("DS4_DBG_HASH"))
+                        std::fprintf(stderr, "ds4: %s hash table %llu bytes, first %d %d %d %d %d %d, hash_layers %d\n",
+                                     P.c_str(), (unsigned long long) tt->bytes, ((const int*) raw.data())[0],
+                                     ((const int*) raw.data())[1], ((const int*) raw.data())[2],
+                                     ((const int*) raw.data())[3], ((const int*) raw.data())[4],
+                                     ((const int*) raw.data())[5], g.hash_layers);
                 }
             }
             l.sink += (size_t) l.ah0;
@@ -5566,7 +5579,11 @@ struct Model::Impl {
     // tokens an entry holds: the i-quant GGUF experts take a whole window's tokens of an expert in one call (the CPU
     // lane's exact multi-token rows, 7+ tokens an expert: decoded once for all), the others (MXFP4, EXL3) up to 8
     static int ent_cap(const Layer& l) {
-        return l.lay.fmt == gg::kFmtMXFP4 && !gg::mx_experts(l.lay) ? kEntMax : kc::kExl3CpuMaxN;
+        if (l.lay.fmt != gg::kFmtMXFP4) return kc::kExl3CpuMaxN;
+        if (gg::mx_experts(l.lay)) return kc::kExl3CpuMaxN;
+        // a mixed layer runs one stage on each lane: the batch must fit both (mx_rows' cap and the i-quant's)
+        if (!gg::mx_gate_up(l.lay) && !gg::mx_down(l.lay)) return kEntMax;
+        return std::min(kEntMax, gg::kMxCpuMaxN);
     }
     void run_nodes(int n, const std::function<void(int)>* f) {
         for (int X = 0; X < NH; ++X) pools[(size_t) X]->start(n, f[X]);
@@ -5581,14 +5598,17 @@ struct Model::Impl {
     // them, exact integer sums a block; every CPU tier the same bits): each token's input quantized once, whatever
     // number of entries take it, and each job its band of h straight into the down's int8 input.
     // (ord: the order the entries are computed in - their slots, so the sums, stay the same; null: as they are)
-    void cpu_experts_mx(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord) {
-        if (!gg::mx_experts(l.lay)) return cpu_experts_iq(l, x, ents, ldx, ord);
+    void cpu_experts_mx(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord,
+                        bool gu = true, bool down = true) {
+        if ((gu && !gg::mx_gate_up(l.lay)) || (down && !gg::mx_down(l.lay))) return;   // (the dispatcher's choice)
         constexpr int RB = 64;   // rows a job (whole blocks of h: RB % 32 == 0)
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH;
         const int GB = (FFh + RB - 1) / RB, DB = (Eh + RB - 1) / RB, ne = (int) ents.size();
         const size_t gr = gg::mx_row_bytes(E), dr = gg::mx_row_bytes(FF);
         const size_t xa = gg::mx_act_bytes(E), ha = gg::mx_act_bytes(FF);
-        const bool band_q = FFh % 32 == 0;   // (each job's rows whole blocks of h)
+        // (each job's rows whole blocks of h; the swiglu's h goes straight to its int8 blocks only when the down is
+        // this lane's too - the other lane quantizes the F32 h its own way)
+        const bool band_q = FFh % 32 == 0 && gu && down;
         const float lim = g.lim;
         static_assert(kc::kExl3CpuMaxN <= gg::kMxCpuMaxN, "a CPU-lane entry's tokens in one call");
         {   // the experts read from the files (not in the RAM tier) that are not resident: all their pages asked for at
@@ -5610,7 +5630,7 @@ struct Model::Impl {
             const int t = en.tok[i];
             return t < kWin ? xq + (size_t) t * xa : xq_extra + (size_t) (en.slot0 + i) * xa;
         };
-        {
+        if (gu) {
             bool done[kWin] = {};
             for (const Ent& en : ents)
                 for (int i = 0; i < en.n; ++i) {
@@ -5649,8 +5669,8 @@ struct Model::Impl {
                     if (band_q) gg::mx_quant_blocks(h, r0 / 32, r1 / 32, hq + (size_t) (en.slot0 + i) * ha, FF);
                 }
             };
-        run_nodes(ne * GB, f);
-        if (!band_q)
+        if (gu) run_nodes(ne * GB, f);
+        if (down && !band_q)
             for (const Ent& en : ents)
                 for (int i = 0; i < en.n; ++i)
                     gg::mx_quant(c_xhd.data() + (size_t) (en.slot0 + i) * FF, FF, hq + (size_t) (en.slot0 + i) * ha);
@@ -5666,17 +5686,22 @@ struct Model::Impl {
                 }
                 gg::mx_rows(mx_part_ptr(l, en.e, 2, X), dr, FF, r0 - X * Eh, r1 - X * Eh, ap, en.n, yp);
             };
-        run_nodes(ne * DB, f);
+        if (down) run_nodes(ne * DB, f);
     }
     // ... the low-bit ones (ds4_iq's types): as above, through ggml-cpu's dots (gg::iq_cpu_*) - each token's input
     // quantized once to the weight type's activation (Q8_K) in its c_xh row's bytes, then (h whole) its h the same
-    void cpu_experts_iq(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord) {
+    void cpu_experts_iq(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord,
+                        bool gu = true, bool down = true) {
+        if ((gu && !gg::mx_role(l.lay, 0)) || (down && !gg::mx_role(l.lay, 2))) return;   // (the dispatcher's choice)
         constexpr int RB = 64;   // rows a job
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH;
         const int GB = (FFh + RB - 1) / RB, DB = (Eh + RB - 1) / RB, ne = (int) ents.size();
         gg::IqCpu fm;
         std::string ferr;
-        if (!gg::iq_cpu_fmt(gg::expert_type(l.lay, 0), gg::expert_type(l.lay, 2), E, FF, fm, ferr) ||
+        // (a half call leaves the other role out: its type stands in, so the format still answers)
+        const int tg = gu ? gg::expert_type(l.lay, 0) : gg::expert_type(l.lay, 2);
+        const int td = down ? gg::expert_type(l.lay, 2) : gg::expert_type(l.lay, 0);
+        if (!gg::iq_cpu_fmt(tg, td, E, FF, fm, ferr) ||
             fm.act_bytes > (size_t) E * 4 || fm.h_bytes > (size_t) E * 4) {
             static std::atomic<bool> said{false};
             if (!said.exchange(true)) std::fprintf(stderr, "ds4: layer %d's CPU-lane experts: %s\n", l.il, ferr.c_str());
@@ -5703,7 +5728,7 @@ struct Model::Impl {
             const int t = en.tok[i];
             return aq + (size_t) (t < kWin ? t : kWin + en.slot0 + i) * E * 4;
         };
-        {
+        if (gu) {
             bool done[kWin] = {};
             for (const Ent& en : ents)
                 for (int i = 0; i < en.n; ++i) {
@@ -5729,11 +5754,12 @@ struct Model::Impl {
                 gg::iq_cpu_gate_up(fm, mx_part_ptr(l, en.e, 0, X), mx_part_ptr(l, en.e, 1, X), ap, en.n, hp,
                                    r0 - X * FFh, r1 - X * FFh, lim);
             };
-        run_nodes(ne * GB, f);
-        for (const Ent& en : ents)
-            for (int i = 0; i < en.n; ++i)
-                gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF, FF,
-                                 aq + (size_t) (kWin + en.slot0 + i) * E * 4);
+        if (gu) run_nodes(ne * GB, f);
+        if (down)
+            for (const Ent& en : ents)
+                for (int i = 0; i < en.n; ++i)
+                    gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF, FF,
+                                     aq + (size_t) (kWin + en.slot0 + i) * E * 4);
         for (int X = 0; X < NH; ++X)
             f[X] = [&, X](int j) {
                 const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / DB] : j / DB)];
@@ -5746,7 +5772,7 @@ struct Model::Impl {
                 }
                 gg::iq_cpu_down(fm, mx_part_ptr(l, en.e, 2, X), hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
             };
-        run_nodes(ne * DB, f);
+        if (down) run_nodes(ne * DB, f);
     }
 
     // the window's CPU-lane experts made ready (and pinned) in the store for the length of the call
@@ -5772,7 +5798,15 @@ struct Model::Impl {
         if (ldx == 0) ldx = (size_t) g.dim;
         if (l.lay.fmt == gg::kFmtMXFP4) {
             StoreHold hold(this, l, ents);
-            return cpu_experts_mx(l, x, ents, ldx, ord);
+            if (gg::mx_gate_up(l.lay) && gg::mx_down(l.lay)) return cpu_experts_mx(l, x, ents, ldx, ord);
+            if (!gg::mx_gate_up(l.lay) && !gg::mx_down(l.lay)) return cpu_experts_iq(l, x, ents, ldx, ord);
+            // a mixed layer (unsloth's UD-IQ2_XXS, layers 26 and 42): one lane's gate/up, then the other's down
+            if (gg::mx_gate_up(l.lay)) {
+                cpu_experts_mx(l, x, ents, ldx, ord, true, false);
+                return cpu_experts_iq(l, nullptr, ents, ldx, ord, false, true);
+            }
+            cpu_experts_iq(l, x, ents, ldx, ord, true, false);
+            return cpu_experts_mx(l, nullptr, ents, ldx, ord, false, true);
         }
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH, GQ = E / 256, DQ = FF / 128;
         const int GB = FFh / 128, DB = Eh / 128, EB = E / 128, FB = FF / 128;
@@ -9022,6 +9056,13 @@ struct Model::Impl {
             if (!mv(d, {job(l.wo_b, d.oa, d.ao, T, (size_t) OG * g.o_lora, D)}, err)) return false;
         } else CK(cudaMemsetAsync(d.ao, 0, (size_t) T * D * sizeof(*d.ao), s));   // (no heads: nothing to add)
         if (nm > 1) allreduce(d.ao, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
+        if (attn_dump_f != nullptr && l.il == attn_dump_layer) {   // (debug) the attention output, before hc_post
+            std::vector<float> av((size_t) T * D);
+            CK(cudaMemcpyAsync(av.data(), d.ao, av.size() * 4, cudaMemcpyDeviceToHost, s));
+            CK(cudaStreamSynchronize(s));
+            std::fwrite(av.data(), 4, av.size(), attn_dump_f);
+            std::fflush(attn_dump_f);
+        }
         hc_post(d.ao, d.h, d.a_post, d.a_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
         if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, 1000 + l.il, p0, T);   // (DS4_DUMP_L: after the attention)
@@ -9051,7 +9092,7 @@ struct Model::Impl {
             }
             route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
                           d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
-                          na[1]);
+                          na[1], d.tids, l.mtp ? nullptr : l.tid2eid);
             if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
             swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
             if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err)) return false;

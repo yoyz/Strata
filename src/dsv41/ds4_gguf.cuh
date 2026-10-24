@@ -43,6 +43,12 @@ inline int expert_type(const x3::ExpertLayout& l, int r) { return l.K[r] == 0 ? 
 inline bool mx_experts(const x3::ExpertLayout& l) {
     return expert_type(l, 0) == kTypeMXFP4 && expert_type(l, 1) == kTypeMXFP4 && expert_type(l, 2) == kTypeMXFP4;
 }
+/// Whether a role (0 gate, 1 up, 2 down) is MXFP4: a GGUF may mix the families between the gate/up pair and the down
+/// (unsloth's UD-IQ2_XXS: IQ2_S / IQ2_XXS gate and up over an MXFP4 down on two layers), and the two families take the
+/// same activations, so each stage picks its own.
+inline bool mx_role(const x3::ExpertLayout& l, int r) { return expert_type(l, r) == kTypeMXFP4; }
+inline bool mx_gate_up(const x3::ExpertLayout& l) { return mx_role(l, 0) && mx_role(l, 1); }
+inline bool mx_down(const x3::ExpertLayout& l) { return mx_role(l, 2); }
 /// Bytes of a row of k values of an expert type (0: not one the device kernels take, or k not whole blocks).
 size_t type_row_bytes(int type, int64_t k);
 /// Values a block of an expert type (32: MXFP4, 256: the low-bit ones; 0: neither).

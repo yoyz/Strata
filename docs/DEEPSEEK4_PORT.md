@@ -1,9 +1,8 @@
 # Porting the DeepSeek engine to DeepSeek-V4-Flash-0731 (`deepseek4`)
 
-Status: **experimental, not usable.** The packer accepts the model, the engine loads it, decodes, and runs the
-model's own sparse attention (the compressor and the indexer) — but a real pack is still missing (item 3), and with it
-any comparison against llama.cpp. This note is the restart point: what is done, what is left, and how to build and
-run it.
+Status: **experimental, not usable.** A real pack builds and runs (item 3), the hash layers' routing is checked
+against llama.cpp, and the layer-by-layer comparison puts the remaining error in the first layer's attention (item 4).
+This note is the restart point: what is done, what is left, and how to build, run and compare it.
 
 ## Where this stands
 
@@ -15,7 +14,8 @@ Branch `f-dsv41-ds4`, worktree `/mnt/nvme_lexar_0/ollama/.local/share/opencode/w
 | `f66aafa4` | the head hyper-connection and the hash layers' routing |
 | `990bb791` | this note and the scripted test pack |
 | `03e7a42a` | the compressor: two halves a row (CSA's overlap), the position table, and the ring that keeps a group across a chunk |
-| `this commit` | the indexer's own compressor (the LID keys), its rotation, and every compressed row on the ratio-128 layers |
+| `a751ca6e` | the indexer's own compressor (the LID keys), its rotation, and every compressed row on the ratio-128 layers |
+| `this commit` | item 3 (MXFP4 beside i-quant gate/up) and the hash layers' routing on the async window path |
 
 Measured 2026-10-24, RX 9070 XT (16 GiB, gfx1201), 125 GiB RAM, one NVMe, the Qwen server stopped, the test pack
 (no expert profile, cold store): dense weights 6.7 s, whole load 12.6 s, 763 of 11,008 experts in VRAM (6.1 GB), the
@@ -107,7 +107,7 @@ the comparison hooks for the validation step.
     tokens), and the test pack's two substituted layers are in the way before that. What is measured: a 2200-token
     prompt runs the selection (550 rows -> 512) without a fault, at 199 tokens/s.
 
-- [ ] **3. MXFP4 mixed with the I-quants (the real pack has it).** *Written down 2026-10-24, not started.*
+- [x] **3. MXFP4 mixed with the I-quants (the real pack has it).** Done in this commit.
   - From the GGUF: layers 26 and 42 of UD-IQ2_XXS are **IQ2_S (26) / IQ2_XXS (42) gate and up with an MXFP4 down**;
     every other layer has one type for all three roles (IQ3_XXS down beside IQ2_XXS gate/up is common and already
     works - `lay.K[r]` is per role).
@@ -121,10 +121,23 @@ the comparison hooks for the validation step.
     stride, so split `cpu_experts_mx` / `cpu_experts_iq` into a gate/up half (x -> h, the swiglu) and a down half
     (h -> y) and run one of each for a mixed layer; an entry's token batch becomes
     `min(gg::kMxCpuMaxN, kEntMax)` (see `ent_cap`).
-  - Then: build the pack with `pack_gguf.py` alone (no `ds4_testpack.py`), `smoke.py`, then item 4 - the first time
-    the engine's own numbers can be compared with llama.cpp.
+  - Landed: `gg::mx_role` / `mx_gate_up` / `mx_down` (ds4_gguf.cuh) and one dispatch per stage in `moe_gate_up`,
+    `moe_down`, `win_experts`, `set_gate_up`, `set_down`; `iq_args` checks only the stages a call uses; the CPU lane's
+    two lanes take `gu` / `down` flags and a mixed layer runs one of each (`ent_cap` is the smaller of the two); and
+    `expert_layout_mx` now only asks that gate and up match. `ds4_testpack.py` is no longer needed: `pack_gguf.py`
+    alone builds the pack the model is.
+  - Measured (RX 9070 XT): the real pack loads and runs, layers 26 and 42's i-quant gate/up over the MXFP4 down on
+    both the device and the CPU lane, 2200-token prompt at 199 tokens/s. The smoke question still comes out wrong -
+    item 4 found the reason elsewhere.
 
-- [ ] **4. Validation against llama.cpp.**
+- [x] **The hash layers' routing on the async window path.** Found while comparing with llama.cpp (item 4). The decode
+  window publishes its routing through `route_publish` (a mailbox for the CPU lane, and the VRAM experts' plan), and
+  that kernel only knew the top-k: on the first `hash_layer_count` layers it took the gate's six best instead of
+  `ffn_gate_tid2eid[token]`. The chunk path and the non-async window path always passed the table, which is why every
+  earlier run hid it. Now layers 0-2's picks are identical to llama.cpp's (`ffn_moe_topk-0`, tokens 23166 and 3:
+  212 61 77 1 133 107 / 102 69 182 162 51 42), and `DS4_TRACE` shows the same six ids on the engine's side.
+
+- [ ] **4. Validation against llama.cpp.** *Started: the method works; the first layer's attention is wrong.*
   - A fixed token sequence, `--dump-logits` from the engine, llama.cpp's logits for the same ids (the pinned
     checkout has `models/deepseek4.cpp`; build `llama-cli`/`llama-perplexity` from it or use the binary the GGUF was
     tested with).
@@ -132,6 +145,20 @@ the comparison hooks for the validation step.
     need a debug hook).
   - Then 8K context, then speed with an expert profile (`tools/dsv41` has the profile tools; the shipped
     `profile-2.00.bin` is for the IST-DAS sets, not this model).
+  - The method that works: `llama-eval-callback` from the pinned checkout (`build-rocm/bin`, `-ngl 0` and the ROCm
+    SDK's `LD_LIBRARY_PATH`; `-ngl 999` tries to put 86 GB on the card) dumps every graph tensor, the engine dumps its
+    residual streams with `DS4_DUMP_L` and its router inputs with `DS4_XIN_DUMP`, `DS4_TRACE` its picks. One token is
+    enough: causal attention makes token 0 independent of the rest.
+  - Where it stands (token 23166, `l_last-N`, hc streams 0..3, dims 0..2): layer 0's streams 1 and 2 are the
+    embedding on both sides (0.1100 -0.1062 0.0019 against 0.1098 -0.1059 0.0019, the carry-through of the
+    hyper-connection), and stream 0 is 0.2077 -0.1608 0.1073 in llama.cpp against 0.1779 -0.1188 0.0033 in the
+    engine. With the picks now identical, the divergence is inside layer 0's attention: `attn_out-0` (after `wo_b`)
+    is 2.4851 -1.3255 2.6918 against 1.6709 -0.3641 -0.0334.
+  - Next: tap layer 0's `q`, the window's `k`/`v` rows and the sink, and compare with llama.cpp's `q-0`, `kv-0`,
+    `attn_derope-0`. The hook `DS4_DUMP_ATTN=<layer>:<file>` already writes a layer's attention output before
+    `hc_post` (the window path) - the per-head rows still need a tap. First suspects: the sink's use, and the FP8
+    rounding of the window rows and of the attention output, which the engine does (DeepSeek's inference does) and
+    llama.cpp does not.
 
 - [ ] **5. Not started, after the engine matches:** the model in `setup.py`/`strata_control` (family, pin, sizes),
   the server hand-off, and a `strata-dsv41` package for the feed.
