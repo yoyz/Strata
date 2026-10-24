@@ -457,7 +457,8 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_kernel(const float* __restr
 // ---------------------------------------------------------------- the router
 __global__ void __launch_bounds__(512) route_kernel(const float* __restrict__ logits, const float* __restrict__ bias,
                                                     int n, int k, float route_scale, int* idx, float* w,
-                                                    const float* __restrict__ bias_vl, const VlBits vl) {
+                                                    const float* __restrict__ bias_vl, const VlBits vl,
+                                                    const int* __restrict__ tids, const int* __restrict__ tid2eid) {
     __shared__ float sc[1024], bs[1024];
     __shared__ float bv[32];
     __shared__ int bi[32];
@@ -472,6 +473,22 @@ __global__ void __launch_bounds__(512) route_kernel(const float* __restrict__ lo
         bs[i] = sc[i] + bias[i];
     }
     __syncthreads();
+    if (tid2eid != nullptr) {
+        // deepseek4's hash layers: the six experts come from the model's token table, not from the gate; the weights
+        // are the gate's scores at them, as with the top-k (no bias on these layers)
+        if (threadIdx.x < k)
+            pick[threadIdx.x] = __ldg(tid2eid + (size_t) __ldg(tids + t) * k + threadIdx.x);
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float s = 0.0f;
+            for (int r = 0; r < k; ++r) s += sc[pick[r]];
+            for (int r = 0; r < k; ++r) {
+                idx[(size_t) t * kPicks + r] = pick[r];
+                w[(size_t) t * kPicks + r] = sc[pick[r]] / (s + 1e-20f) * route_scale;
+            }
+        }
+        return;
+    }
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
     for (int r = 0; r < k; ++r) {
         float best = -FLT_MAX;
@@ -1933,10 +1950,24 @@ void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int
 }
 
 void route(const float* logits, const float* bias, int n, int k, int T, float route_scale, int* idx, float* w,
-           cudaStream_t s, const float* bias_vl, const VlBits* vl) {
+           cudaStream_t s, const float* bias_vl, const VlBits* vl, const int* tids, const int* tid2eid) {
     static const VlBits none = {};
     route_kernel<<<T, 512, 0, s>>>(logits, bias, n, k, route_scale, idx, w, vl != nullptr ? bias_vl : nullptr,
-                                   vl != nullptr ? *vl : none);
+                                   vl != nullptr ? *vl : none, tids, tid2eid);
+}
+
+__global__ void head_hc_pre_kernel(const float* __restrict__ mixes, const float* __restrict__ scale,
+                                   const float* __restrict__ base, int hc, float eps, float* __restrict__ pre) {
+    const int t = blockIdx.x;
+    mixes += (size_t) t * 32;
+    pre += (size_t) t * 8;
+    for (int m = threadIdx.x; m < hc; m += blockDim.x)
+        pre[m] = 1.0f / (1.0f + expf(-(mixes[m] * scale[0] + base[m]))) + eps;
+}
+
+void head_hc_pre(const float* mixes, const float* scale, const float* base, int hc, float eps, float* pre, int T,
+                 cudaStream_t s) {
+    if (T > 0) head_hc_pre_kernel<<<T, 32, 0, s>>>(mixes, scale, base, hc, eps, pre);
 }
 
 void swiglu(const float* g, const float* u, int n, float lim, float* h, cudaStream_t s) {

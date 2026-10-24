@@ -105,8 +105,8 @@ and the head. llama.cpp: `build_hc_head`. The engine applies hyper-connections o
 `tools/dsv41/pack_gguf.py`:
 
 - accepts `deepseek4` as a model architecture (`MODEL_ARCHS`);
-- maps the new tensors: `attn.compressor.ape`, `attn.indexer.compressor.{ape,wkv,wgate,norm}`, `head.hc_*`,
-  `ffn.gate.tid2eid` (the last still skipped as metadata);
+- maps the new tensors: `attn.compressor.ape`, `attn.indexer.compressor.{ape,wkv,wgate,norm}`, `head.hc_*`, and
+  carries `ffn.gate.tid2eid` as an I32 table (`layers.N.ffn.gate.tid2eid`);
 - writes a header-only `engram.bin` when the model has no Engram (the engine opens it unconditionally);
 - takes the tokenizer's `pre` from the GGUF (`joyai-llm`) instead of assuming `deepseek3`;
 - synthesises `kv_source_layer_ids` (every ratio>0 layer) and leaves `index_source_layer_ids` empty (the old
@@ -119,12 +119,12 @@ IQ2_XXS/IQ2_S/MXFP4 per layer.
 
 | Where | What |
 |---|---|
-| `ds4_kernels.cu` `compress_win` / `compress_kernel` | `coff` (2 for ratio 4), the `ape` add by slot, and the 2-row overlap the ratio-4 groups use |
-| `ds4_model.cu` `Src` / `Layer::c_kv`, `c_score`, `latent` | ratio-4 rows at `2·head`; the compressed state stays per layer (already the case when each ratio>0 layer is a source) |
-| `ds4_model.cu` indexer | a second compressor (128 wide) and its keys, replacing `indexer.wk` on these layers |
-| `route()` / `moe_route` | expert selection from `tid2eid[token]` on layers 0–2, gate weights at those ids |
-| head | the `output_hc_*` mix before `norm.weight` |
-| `pack_gguf.py` + engine | carry the I32 `ffn_gate_tid2eid` table into the pack (today it is skipped) |
+| `ds4_kernels.cu` `compress_win` / `compress_kernel` | **not written**: `coff` (2 for ratio 4), the `ape` add by slot, and the 2-row overlap the ratio-4 groups use |
+| `ds4_model.cu` `Src` / `Layer::c_kv`, `c_score`, `latent` | **not written**: ratio-4 rows at `2·head`; the compressed state stays per layer (already the case when each ratio>0 layer is a source) |
+| `ds4_model.cu` indexer | **not written**: a second compressor (128 wide) and its keys, replacing `indexer.wk` on these layers |
+| `route()` / `moe_route` | **done**: experts from `tid2eid[token]` on layers 0–2, the gate's weights at those ids (`route(..., tids, tid2eid)`) |
+| head | **done**: `head_pre()` runs the `output_hc_*` mix (`hc_mix` + `head_hc_pre`) before `norm.weight` |
+| `pack_gguf.py` + engine | **done**: the I32 `ffn_gate_tid2eid` table is carried and uploaded per hash layer |
 
 Until all four are in, a pack of this model loads but cannot answer correctly: the compressed rows, the attention
 selection and three layers' experts would be wrong.

@@ -94,8 +94,16 @@ constexpr int kVlRows = 8192;
 struct VlBits {
     uint32_t w[kVlRows / 32];
 };
+/// deepseek4's hash layers: tid2eid[tids[t] * k + r] is the r-th expert of that token (I32); the weights are still the
+/// gate's scores at those experts.  nullptr: the top-k of the gate, as before.
 void route(const float* logits, const float* bias, int n, int k, int T, float route_scale, int* idx, float* w,
-           cudaStream_t s, const float* bias_vl = nullptr, const VlBits* vl = nullptr);
+           cudaStream_t s, const float* bias_vl = nullptr, const VlBits* vl = nullptr, const int* tids = nullptr,
+           const int* tid2eid = nullptr);
+
+/// deepseek4's head hyper-connection: pre[m] = sigmoid(mixes[m] * scale[0] + base[m]) + eps, m < hc (mixes: hc values
+/// a token, 32 apart; pre: 8 a token), for T rows.
+void head_hc_pre(const float* mixes, const float* scale, const float* base, int hc, float eps, float* pre, int T,
+                 cudaStream_t s);
 
 /// h = silu(min(g, lim)) * clamp(u, -lim, lim)  (lim <= 0: no clamp); n values.
 void swiglu(const float* g, const float* u, int n, float lim, float* h, cudaStream_t s);

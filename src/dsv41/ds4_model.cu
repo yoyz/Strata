@@ -391,7 +391,7 @@ struct Pack {
 struct Geo {
     int vocab = 0, dim = 0, nl = 0, heads = 0, hd = 0, rd = 0, q_lora = 0, o_lora = 0, o_groups = 0, n_exp = 0,
         k_exp = 0, ff = 0, win = 0, hc = 0, sinkhorn = 0, ix_heads = 0, ix_hd = 0, ix_topk = 0, cand_src = -1,
-        cand_topk = 0, cand_blk = 0, orig_ctx = 0, eos = 1;
+        cand_topk = 0, cand_blk = 0, orig_ctx = 0, eos = 1, hash_layers = 0;
     float eps = 1e-20f, hc_eps = 1e-6f, route_scale = 1.0f, lim = 0.0f;
     double rope_theta = 1e4, comp_theta = 1e4, factor = 1.0, beta_fast = 32, beta_slow = 1;
     std::vector<int> ratios, kv_src, ix_src, eg_layers;
@@ -413,6 +413,7 @@ struct Geo {
         cand_blk = (int) p.num("candidate_block_size", 0);
         orig_ctx = (int) p.num("rope_scaling.original_max_position_embeddings", 0);
         eos = (int) p.num("eos_token_id", 1);
+        hash_layers = (int) p.num("hash_layer_count", 0);   // deepseek4: the first layers route by token id
         eps = (float) p.num("rms_norm_eps", 1e-20), hc_eps = (float) p.num("hc_eps", 1e-6);
         route_scale = (float) p.num("routed_scaling_factor", 1.0), lim = (float) p.num("swiglu_limit", 0.0);
         rope_theta = p.num("rope_theta", 1e4), comp_theta = p.num("compress_rope_theta", 1e4);
@@ -471,7 +472,7 @@ struct Dev {
           *freqs_win = nullptr, *freqs_comp = nullptr, *xe = nullptr, *xg = nullptr, *xu = nullptr, *xhh = nullptr,
           *ed = nullptr;
     float* glog_a = nullptr;   // lookahead: the next two layers' gate logits on this layer's FFN input (rows 1024 apart)
-    int *ridx = nullptr, *topk = nullptr, *cand = nullptr, *tok = nullptr;
+    int *ridx = nullptr, *topk = nullptr, *cand = nullptr, *tok = nullptr, *tids = nullptr;   // tids: the window's token ids
     unsigned long long* plan_ptr = nullptr;           // the decode path's VRAM experts (0: on the CPU lane)
     uint8_t* eg_rows = nullptr;
     uint16_t *emb_rows = nullptr, *ext = nullptr;   // the window's embedding rows; the window attention's rows
@@ -491,6 +492,9 @@ struct Dev {
     // logits_part: a member's share of the logits (the lead's: where the others' land before they join its rows)
     x3::Mat head;
     float *norm_w = nullptr, *d_norm = nullptr, *logits_part = nullptr;
+    // deepseek4's head hyper-connection: fn [hc][hc*dim], base [hc], scale [1]; nullptr: the head reads the last
+    // layer's pre mix, as V4.1 does
+    float *hc_head_fn = nullptr, *hc_head_base = nullptr, *hc_head_scale = nullptr;
     unsigned head_seq = 0;
     // the drafter's markov bias over the head group (markov_share): this member's rows [mk_v0, mk_v0 + mk_vn) of the
     // markov head, the previous token's E row, the drafted tokens (the lead's: d_ints)
@@ -642,6 +646,7 @@ struct Layer {
           *gate_bias_vl = nullptr;   // (the image tokens' routing bias, with the vision tower)
     uint16_t* i_wproj = nullptr;
     float* gate_w = nullptr;   // the router's weights, F32 (DeepSeek's inference computes the gate in F32)
+    int* tid2eid = nullptr;    // deepseek4's hash layers: [k_exp][vocab] token id -> expert id (I32), else nullptr
     uint8_t* win = nullptr;                     // [win] rows of kKvFp8 (kv_row_bytes)
     float *c_kv = nullptr, *c_score = nullptr;  // the compressor's partial group (ratio > 1)
     // a run of chunks' mid-run checkpoint (feed_mark): the ring and the partial group as they were before a row
@@ -2277,7 +2282,7 @@ struct Model::Impl {
                       dalloc(d, d.sh_out, W * D, err) && dalloc(d, d.cpu_part, W * D, err) &&
                       dalloc(d, d.freqs_win, 64, err) && dalloc(d, d.freqs_comp, 64, err) &&
                       dalloc(d, d.topk, W * topk_stride(), err) && dalloc(d, d.cand, W * cand_stride(), err) &&
-                      dalloc(d, d.tok, 16, err) && dalloc(d, d.emb_rows, W * D, err) &&
+                      dalloc(d, d.tok, 16, err) && dalloc(d, d.tids, W, err) && dalloc(d, d.emb_rows, W * D, err) &&
                       dalloc(d, d.ext, ((size_t) g.win + W) * g.hd, err) && dalloc(d, d.xe, P * D, err) &&
                       dalloc(d, d.xg, P * g.ff, err) && dalloc(d, d.xu, P * g.ff, err) && dalloc(d, d.xhh, P * g.ff, err) &&
                       dalloc(d, d.ed, P * D, err) && dalloc(d, d.plan_ptr, P, err);
@@ -3616,6 +3621,19 @@ struct Model::Impl {
                       mat(d, P + "ffn.shared_experts.w2", l.s2, err, acct, mi, nm, false, l.il % nm) &&
                       mat(d, P + "ffn.shared_experts.w3", l.s3, err, acct, mi, nm, true, l.il % nm);
             if (!ok) return false;
+            if (l.il < g.hash_layers) {   // deepseek4: the experts the token id picks (I32 [k_exp][vocab])
+                const Tensor* tt = pk.get(P + "ffn.gate.tid2eid");
+                if (tt != nullptr) {
+                    std::vector<uint8_t> raw(tt->bytes);
+                    if (!pk.read(*tt, raw.data())) {
+                        err = P + "ffn.gate.tid2eid: read failed";
+                        return false;
+                    }
+                    if (!dalloc(d, l.tid2eid, tt->bytes / 4, err, acct)) return false;
+                    cudaSetDevice(d.id);
+                    CK(cudaMemcpyAsync(l.tid2eid, raw.data(), tt->bytes, cudaMemcpyHostToDevice, d.st));
+                }
+            }
             l.sink += (size_t) l.ah0;
             for (int gi = 0; gi < l.ogn; ++gi)
                 if (!mat(d, A + "wo_a.slice." + std::to_string(l.og0 + gi), l.wo_a[gi], err, acct)) return false;
@@ -3662,6 +3680,10 @@ struct Model::Impl {
         if (d.grp == devs[(size_t) head_dev].grp) {   // the head: each member of its group a share of the columns
             const int hn = head_nm();
             if (!mat(d, "head", d.head, err, acct, d.mi, hn, true) || !f32(d, "norm.weight", d.norm_w, err, acct, (size_t) g.dim))
+                return false;
+            if (pk.get("head.hc_fn") != nullptr &&
+                (!f32(d, "head.hc_fn", d.hc_head_fn, err, acct) || !f32(d, "head.hc_base", d.hc_head_base, err, acct) ||
+                 !f32(d, "head.hc_scale", d.hc_head_scale, err, acct)))
                 return false;
             if (g.n_mtp > 0 && !f32(d, "mtp." + std::to_string(g.n_mtp - 1) + ".norm.weight", d.d_norm, err, acct, (size_t) g.dim))
                 return false;
@@ -7008,7 +7030,8 @@ struct Model::Impl {
             VlBits vb;
             const bool vl = l.gate_bias_vl != nullptr && vl_bits(p0 + r0, nr, vb);
             route(c.glog + (size_t) r0 * 1024, l.gate_bias, l.n_exp, l.k_exp, nr, g.route_scale,
-                  c.ridx + (size_t) r0 * kPicks, c.rw + (size_t) r0 * kPicks, s, l.gate_bias_vl, vl ? &vb : nullptr);
+                  c.ridx + (size_t) r0 * kPicks, c.rw + (size_t) r0 * kPicks, s, l.gate_bias_vl, vl ? &vb : nullptr,
+                  d.tids + r0, l.mtp ? nullptr : l.tid2eid);
         }
         const int n_vs = L0.n_slots + (int) L0.host_list.size();
         CK(cudaMemcpyAsync(l.vs_dev, l.vs_pin, (size_t) l.n_exp * 4, cudaMemcpyHostToDevice, s));   // (this member's)
@@ -7316,6 +7339,7 @@ struct Model::Impl {
                     const size_t base = (size_t) (p0 - run.p0[0]) * g.vocab;
                     for (int r0 = 0; r0 < T; r0 += kWin) {
                         const int nr = std::min(kWin, T - r0);
+                        if (!head_pre(d, c.h + (size_t) r0 * H * D, nr, c.pre + (size_t) r0 * 8, err)) return false;
                         hc_pre_norm(c.h + (size_t) r0 * H * D, c.pre + (size_t) r0 * 8, d.norm_w, D, H, nr, g.eps, d.x, s);
                         if (!head_share(d, d.mi, d.x, nr, err)) return false;
                         CK(cudaMemcpyAsync(chunk_logits.data() + base + (size_t) r0 * g.vocab, d.logits,
@@ -7324,6 +7348,7 @@ struct Model::Impl {
                     }
                 } else if (last_k && n_logits > 0) {   // (the last rows' logits, into the window path's buffers)
                     const int t0 = T - n_logits;
+                    if (!head_pre(d, c.h + (size_t) t0 * H * D, n_logits, c.pre + (size_t) t0 * 8, err)) return false;
                     hc_pre_norm(c.h + (size_t) t0 * H * D, c.pre + (size_t) t0 * 8, d.norm_w, D, H, n_logits, g.eps, d.x, s);
                     if (!head_share(d, d.mi, d.x, n_logits, err)) return false;
                 }
@@ -7502,6 +7527,7 @@ struct Model::Impl {
                     const size_t base = (size_t) (p0 - run.p0[0]) * g.vocab;
                     for (int r0 = 0; r0 < T; r0 += kWin) {
                         const int nr = std::min(kWin, T - r0);
+                        if (!head_pre(d, c.h + (size_t) r0 * H * D, nr, c.pre + (size_t) r0 * 8, err)) return false;
                         hc_pre_norm(c.h + (size_t) r0 * H * D, c.pre + (size_t) r0 * 8, d.norm_w, D, H, nr, g.eps, d.x, s);
                         if (!head_share(d, d.mi, d.x, nr, err)) return false;
                         if (di != head_dev) continue;
@@ -7511,6 +7537,7 @@ struct Model::Impl {
                     }
                 } else if (last_k && n_logits > 0) {   // (the last rows' logits, into the window path's buffers)
                     const int t0 = T - n_logits;
+                    if (!head_pre(d, c.h + (size_t) t0 * H * D, n_logits, c.pre + (size_t) t0 * 8, err)) return false;
                     hc_pre_norm(c.h + (size_t) t0 * H * D, c.pre + (size_t) t0 * 8, d.norm_w, D, H, n_logits, g.eps, d.x, s);
                     if (!head_share(d, d.mi, d.x, n_logits, err)) return false;
                 }
@@ -8258,6 +8285,18 @@ struct Model::Impl {
         return true;
     }
 
+    // deepseek4's head hyper-connection: the pre mix of the head's four states (llama.cpp's build_hc_head) into `pre`
+    // (8 a token).  Without output_hc_fn (V4.1) the last layer's ffn pre stays where it is.
+    bool head_pre(Dev& d, const float* h, int rows, float* pre, std::string& err) {
+        if (d.hc_head_fn == nullptr) return true;
+        const int D = g.dim, H = g.hc;
+        cudaSetDevice(d.id);
+        hc_mix(h, d.hc_head_fn, H * D, H, rows, g.eps, d.mix, d.st);
+        head_hc_pre(d.mix, d.hc_head_scale, d.hc_head_base, H, g.hc_eps, pre, rows, d.st);
+        (void) err;
+        return true;
+    }
+
     // the head's rows (the last n_logits of the window) on head group member di (its h / pre: the group's)
     bool head_rows_dev(int di, int T, std::string& err) {
         Dev& d = devs[(size_t) di];
@@ -8265,6 +8304,7 @@ struct Model::Impl {
         const int D = g.dim, H = g.hc;
         if (n_logits <= 0) return true;
         const int t0 = T - n_logits;
+        if (!head_pre(d, d.h + (size_t) t0 * H * D, n_logits, d.pre + (size_t) t0 * 8, err)) return false;
         hc_pre_norm(d.h + (size_t) t0 * H * D, d.pre + (size_t) t0 * 8, d.norm_w, D, H, n_logits, g.eps, d.x, d.st);
         return head_share(d, d.mi, d.x, n_logits, err);
     }
@@ -8320,6 +8360,10 @@ struct Model::Impl {
         plan_window(p0, T, wplan);
         prof_window = prof_on && T == 1;
         n_logits = std::min(logits_rows, T);
+        for (Dev& dd : devs) {   // (deepseek4's hash layers route by token id)
+            cudaSetDevice(dd.id);
+            CK(cudaMemcpyAsync(dd.tids, tk, (size_t) T * 4, cudaMemcpyHostToDevice, dd.st));
+        }
         const double tl = now_ms();
         if (par) {
             if (!forward_par(p0, T, err)) return false;
@@ -8863,7 +8907,7 @@ struct Model::Impl {
         VlBits vb = {};
         vb.w[0] = l.mtp ? 0u : wp.vl;
         route(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, d.ridx, d.rw, s, l.gate_bias_vl,
-              vb.w[0] != 0 ? &vb : nullptr);
+              vb.w[0] != 0 ? &vb : nullptr, d.tids, l.mtp ? nullptr : l.tid2eid);
         CK(cudaMemcpyAsync(h_idx, d.ridx, (size_t) T * kPicks * 4, cudaMemcpyDeviceToHost, s));
         CK(cudaMemcpyAsync(h_w, d.rw, (size_t) T * kPicks * 4, cudaMemcpyDeviceToHost, s));
         CK(cudaMemcpyAsync(h_x, d.x, (size_t) T * D * 4, cudaMemcpyDeviceToHost, s));

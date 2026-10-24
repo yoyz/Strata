@@ -226,6 +226,7 @@ def geometry(kv: dict, vocab: int) -> dict:
         "kv_source_layer_ids": list(g("attention.kv_source_layers", [])),
         "index_source_layer_ids": list(g("attention.indexer.source_layers", [])),
         "engram_layer_ids": list(g("engram.layers", [])),
+        "hash_layer_count": g("hash_layer_count"),
         "max_position_embeddings": g("context_length"),
         "dspark_block_size": g("dspark.block_size", 0),
         "dspark_noise_token_id": g("dspark.noise_token_id", 0),
@@ -580,6 +581,14 @@ def main() -> int:
         for name, typ, dims, off in g.tensors:
             if skip_re is not None and skip_re.search(name):
                 skipped.append("%s (asked for)" % name)
+                continue
+            if arch == "deepseek4" and typ == 26 and re.match(r"blk\.\d+\.ffn_gate_tid2eid\.weight$", name):
+                # deepseek4's hash layers: token id -> its experts, I32 [k_exp][vocab], read as it is (not a weight)
+                nel = 1
+                for dd in dims:
+                    nel *= dd
+                tensors.append(("layers.%s.ffn.gate.tid2eid" % name.split(".")[1], "I32", fi, g.data_start + off,
+                                nel * 4, list(reversed(dims))))
                 continue
             if typ not in TYPES:
                 if typ in (24, 25, 26, 27, 28):   # I8 / I16 / I32 / I64 / F64: metadata carried as tensors, not weights
