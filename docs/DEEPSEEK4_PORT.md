@@ -1,8 +1,10 @@
 # Porting the DeepSeek engine to DeepSeek-V4-Flash-0731 (`deepseek4`)
 
-Status: **experimental, not usable.** A real pack builds and runs (item 3), the hash layers' routing is checked
-against llama.cpp, and the layer-by-layer comparison puts the remaining error in the first layer's attention (item 4).
-This note is the restart point: what is done, what is left, and how to build, run and compare it.
+Status: **it answers, and it matches llama.cpp to 2-5% of a vector's L2.** A real pack builds and runs, and the
+model answers the smoke question ("The capital of France is Paris.") and writes coherent text.  Comparing every stage
+of a layer against llama.cpp's eval-callback found four bugs (below); what is left over is the engine's FP8 rounding of
+the window rows and of the attention output, which DeepSeek's own inference does and llama.cpp does not.  This note is
+the restart point: what is done, what is left, and how to build, run and compare it.
 
 ## Where this stands
 
@@ -15,7 +17,8 @@ Branch `f-dsv41-ds4`, worktree `/mnt/nvme_lexar_0/ollama/.local/share/opencode/w
 | `990bb791` | this note and the scripted test pack |
 | `03e7a42a` | the compressor: two halves a row (CSA's overlap), the position table, and the ring that keeps a group across a chunk |
 | `a751ca6e` | the indexer's own compressor (the LID keys), its rotation, and every compressed row on the ratio-128 layers |
-| `this commit` | item 3 (MXFP4 beside i-quant gate/up) and the hash layers' routing on the async window path |
+| `649612e2` | item 3 (MXFP4 beside i-quant gate/up) and the hash layers' routing on the async window path |
+| `332c09c2` | item 4: the per-head q norm, the hyper-connection pre-mix, the CPU lane's i-quant guard, the chunk path's token ids - it answers |
 
 Measured 2026-10-24, RX 9070 XT (16 GiB, gfx1201), 125 GiB RAM, one NVMe, the Qwen server stopped, the test pack
 (no expert profile, cold store): dense weights 6.7 s, whole load 12.6 s, 763 of 11,008 experts in VRAM (6.1 GB), the
@@ -51,19 +54,22 @@ HIP_PLATFORM=amd ninja -j 12 -C /mnt/nvme_lexar_0/ollama_user_cache/strata/build
 HIP_PLATFORM=amd ninja -j 12 -C /mnt/nvme_lexar_0/ollama_user_cache/strata/build-dsv41 ds4_compress_test
 /mnt/nvme_lexar_0/ollama_user_cache/strata/build-dsv41/ds4_compress_test
 
-# the pack (3 MB of metadata; the 91 GB of weights stay where they are)
+# the pack (3 MB of metadata; the 91 GB of weights stay where they are).  Pack 3 is the first one built by a packer that
+# writes hc_lag 0 - a pack made before 332c09c2 gives the old pre-mix and wrong output; re-pack it.
 python3 tools/dsv41/pack_gguf.py \
-  --model /home/ollama/.cache/huggingface/hub/models--unsloth--DeepSeek-V4-Flash-0731-GGUF/snapshots/fbbb5b93fb787c21338159b0af3318bb3f4d9768/UD-IQ2_XXS \
+  --model /mnt/nvme_lexar_0/ollama_user_cache/huggingface/hub/models--unsloth--DeepSeek-V4-Flash-0731-GGUF/snapshots/fbbb5b93fb787c21338159b0af3318bb3f4d9768/UD-IQ2_XXS \
   --out /mnt/nvme_lexar_0/ollama_user_cache/strata/ds4-pack
-python3 tools/dsv41/ds4_testpack.py /mnt/nvme_lexar_0/ollama_user_cache/strata/ds4-pack \
-  /mnt/nvme_lexar_0/ollama_user_cache/strata/ds4-pack-test      # TEST ONLY, see below
 
 # run (the GPU must be free: stop the Qwen server first)
 export LD_LIBRARY_PATH=$V/_rocm_sdk_devel/lib:$V/_rocm_sdk_devel/lib/rocm_sysdeps/lib:$V/_rocm_sdk_libraries_gfx120X_all/lib
 /mnt/nvme_lexar_0/ollama_user_cache/strata/build-dsv41/strata-dsv41 \
-  --pack /mnt/nvme_lexar_0/ollama_user_cache/strata/ds4-pack-test \
-  --ids 100,200,300 --n 4 --max-context 8192 --reserve-mib 1024 \
+  --pack /mnt/nvme_lexar_0/ollama_user_cache/strata/ds4-pack3 \
+  --ids 23166 --n 4 --max-context 8192 --reserve-mib 1024 \
   --expert-profile none --dspark none --cpu-threads 24
+
+# the smoke question, through the pack's own tokenizer (the model must answer with Paris)
+python3 tools/dsv41/smoke.py --exe /mnt/nvme_lexar_0/ollama_user_cache/strata/build-dsv41/strata-dsv41 \
+  --pack /mnt/nvme_lexar_0/ollama_user_cache/strata/ds4-pack3 --tokens 16
 ```
 
 `--pack-info` prints the pack without touching a card. `--dump-logits FILE` and `--score FILE --score-out FILE` are
@@ -137,39 +143,63 @@ the comparison hooks for the validation step.
   earlier run hid it. Now layers 0-2's picks are identical to llama.cpp's (`ffn_moe_topk-0`, tokens 23166 and 3:
   212 61 77 1 133 107 / 102 69 182 162 51 42), and `DS4_TRACE` shows the same six ids on the engine's side.
 
-- [ ] **4. Validation against llama.cpp.** *Started: the method works; the first layer's attention is wrong.*
-  - A fixed token sequence, `--dump-logits` from the engine, llama.cpp's logits for the same ids (the pinned
-    checkout has `models/deepseek4.cpp`; build `llama-cli`/`llama-perplexity` from it or use the binary the GGUF was
-    tested with).
-  - Compare the first tokens' logits layer by layer if possible (`--dump-logits` is final only; a per-layer tap may
-    need a debug hook).
-  - Then 8K context, then speed with an expert profile (`tools/dsv41` has the profile tools; the shipped
+- [x] **4. Validation against llama.cpp.** Done for the token path: four bugs found, each measured, and the model
+  now answers and matches llama.cpp (see "The four bugs" below).  *Left: the same comparison at 8K context, and the
+  speed with an expert profile made for this pack.*
+  - Then: 8K context, then speed with an expert profile (`tools/dsv41` has the profile tools; the shipped
     `profile-2.00.bin` is for the IST-DAS sets, not this model).
-  - The method that works: `llama-eval-callback` from the pinned checkout (`build-rocm/bin`, `-ngl 0` and the ROCm
-    SDK's `LD_LIBRARY_PATH`; `-ngl 999` tries to put 86 GB on the card) dumps every graph tensor, the engine dumps its
-    residual streams with `DS4_DUMP_L` and its router inputs with `DS4_XIN_DUMP`, `DS4_TRACE` its picks. One token is
-    enough: causal attention makes token 0 independent of the rest.
-  - Where it stands (token 23166, `l_last-N`, hc streams 0..3, dims 0..2): layer 0's streams 1 and 2 are the
-    embedding on both sides (0.1100 -0.1062 0.0019 against 0.1098 -0.1059 0.0019, the carry-through of the
-    hyper-connection), and stream 0 is 0.2077 -0.1608 0.1073 in llama.cpp against 0.1779 -0.1188 0.0033 in the
-    engine. With the picks now identical, the divergence is inside layer 0's attention: `attn_out-0` (after `wo_b`)
-    is 2.4851 -1.3255 2.6918 against 1.6709 -0.3641 -0.0334.
-  - Next: tap layer 0's `q`, the window's `k`/`v` rows and the sink, and compare with llama.cpp's `q-0`, `kv-0`,
-    `attn_derope-0`. The hook `DS4_DUMP_ATTN=<layer>:<file>` already writes a layer's attention output before
-    `hc_post` (the window path) - the per-head rows still need a tap. First suspects: the sink's use, and the FP8
-    rounding of the window rows and of the attention output, which the engine does (DeepSeek's inference does) and
-    llama.cpp does not.
 
 - [ ] **5. Not started, after the engine matches:** the model in `setup.py`/`strata_control` (family, pin, sizes),
   the server hand-off, and a `strata-dsv41` package for the feed.
 
-## Test-only rewrite in `ds4_testpack.py` (remove when item 3 lands)
+## The four bugs (item 4), and how each was found
 
-1. layers 26 and 42's down experts point at layer 25's / 41's (same shape, wrong values): the engine cannot mix
-   MXFP4 with the I-quants.
+The method: run the engine and llama.cpp on the same token (23166, position 0) and compare every tensor either side
+writes.  The engine's taps: `DS4_DUMP_FFN=<layer>:<file>` (the FFN's input, the MoE's output, the shared expert's),
+`DS4_DUMP_ATTN=<layer>:<file>` (the attention output before `hc_post`), `DS4_DUMP_L=<file>` (every layer's residual
+streams, records `[layer, p0, T, T x hc x dim]`), `DS4_TRACE`.  llama.cpp's side: `examples/eval-callback` prints every
+graph tensor (`llama-eval-callback -m <shard 00001> -p "Hi!" -n 1 -c 512 -ngl 0 -t 24`; `-ngl 999` tries to put 86 GB on
+the card) - its text dump prints 6 values a vector, so for exact numbers a small tool that calls `ggml_backend_tensor_get`
+in the same callback writes the tensors as f32 files.  Two traps: the engine's 1-token runs take the *window* path,
+prompts longer than a window take the *chunk* path (`DS4_CHUNK_MIN=100000` forces the window one), and each path has its
+own dumps.  q and the window's rows needed a tap of their own for bug 1 (a temporary one: `d.q`, `d.kvr`, the row
+`ext` holds, the sink).
 
-It is in `tensors.txt` only; the weights are not touched. A real pack must never be built this way. (The compressor
-matrices are read whole since item 1: `ds4_testpack.py` no longer cuts their first half away.)
+1. **The per-head q norm was missing.** deepseek4 normalizes q one head at a time after `wq_b`, with no weight
+   (llama.cpp's `ggml_rms_norm(q)`).  Engine q vs llama.cpp's: -0.0019 -0.0237 0.0000 against -0.0539 -0.6238 0.0035.
+   `Finish::norm` (ds4_kernels.cuh) makes `finish` normalize without a weight; the packer writes `attn_q_head_norm 1`
+   for deepseek4 only, so a V4.1 pack keeps the plain `wq_b` output.  After it, q matches to cos 0.99997.
+2. **The hyper-connection halves took the wrong pre-mix.** The engine (Maya's `model.py`) lags: the attention reads the
+   previous layer's FFN pre-mix and the FFN this layer's attention pre-mix.  deepseek4 does not - each half takes its
+   own, as llama.cpp's graph has it.  Layer 0's FFN input was the give-away: cos 0.838 against llama.cpp's `ffn_norm-0`
+   (rms 0.228 both), and the router's 256 logits cos 0.842, while the attention output was already 0.9992.  The pack key
+   `hc_lag` (0 for deepseek4, absent for V4.1) picks the scheme at four sites (the attention and the FFN, window and
+   chunk).  After it, the FFN input is cos 0.9994, its gate/up 0.9998, the shared expert's output 0.9996.
+3. **The CPU lane computed nothing for pure i-quant layers.** `cpu_experts_iq`'s guard read
+   `if ((gu && !gg::mx_role(l.lay, 0)) || (down && !gg::mx_role(l.lay, 2))) return;` - it returns when the roles are
+   *not* MXFP4, i.e. for every i-quant layer, which is every layer of an IQ2_XXS pack.  The experts that were not in
+   VRAM contributed nothing (the routed sum equalled the VRAM experts' alone: cos 0.717 against llama.cpp's
+   `ffn_moe_out-0`, rms 0.0682 against 0.1023) while the engine counted them as used.  One `!` each side.  After it the
+   routed sum is cos 0.9989 and the router's weights match llama.cpp's (0.218 0.139 0.344 0.173 0.337 0.289 against
+   0.214 0.140 0.346 0.176 0.335 0.289).
+4. **The chunk path never filled the hash layers' token ids.** `d.tids` (which layers 0..`hash_layer_count-1` route by,
+   `ffn_gate_tid2eid[token]`) is written by the window path only, and the chunk path's routing passed `d.tids + r0` on a
+   `kWin`-entry buffer for slabs of up to `kVlRows` rows.  So a prompt longer than a window routed its first three
+   layers by whatever the last window left in that buffer: layer 0's FFN output was cos 0.924 (token 0) and 0.469
+   (token 3), and the next token's argmax was wrong (940 against 5211).  `d.tids` now holds a chunk and the chunk path
+   uploads each slab's ids.  After it, the chunk path's FFN output is cos 0.9996 / 0.9992 and its logits agree with
+   llama.cpp's.
+
+After the four (prompt `23166,3,4,5`, layer 0, tokens 0 and 3): the attention output cos 0.9992-0.9993, the FFN's input
+0.9990-0.9995, its output 0.9991-0.9996, the residual streams of layers 0-2 0.9978-0.9998 (both paths), and the next
+token's logits cos 0.9971 (window) and 0.9959 (chunk) with llama.cpp's argmax (5211).  The logit differences (rms 0.42
+of a spread of about 18) are the engine's FP8 rounding of the window's rows and of the attention output: DeepSeek's
+inference rounds them (the reference's `act_quant`), llama.cpp does not.
+
+Speed on the same box (UD-IQ2_XXS, `--dspark none`, 24 CPU threads, the expert profile and the 48 GB RAM store that
+`strata launch` would give it): a 48-token answer decoded at 6.3 tokens/s, 272 MB read from the disk a token, 9007 of
+its 12126 routed experts on the CPU lane.  The first 4096-token measurement of this branch (33 tokens/s) was taken
+while bug 3 was silencing the CPU lane, so it is not a speed this model can run at.
 
 ## The model
 
