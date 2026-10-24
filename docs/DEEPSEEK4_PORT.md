@@ -107,12 +107,22 @@ the comparison hooks for the validation step.
     tokens), and the test pack's two substituted layers are in the way before that. What is measured: a 2200-token
     prompt runs the selection (550 rows -> 512) without a fault, at 199 tokens/s.
 
-- [ ] **3. MXFP4 mixed with the I-quants (the real pack has it).**
-  - Layers 26 and 42 of UD-IQ2_XXS have MXFP4 down experts; `expert_layout_mx` rejects MXFP4 beside IQ gate/up.
-  - Either read each role with its own kernels (the `ds4_gguf.cu` path branches on `mx_experts(lay)`, all three
-    roles MXFP4, so this means a per-role dispatch in the CPU lane and the GPU windows), or requantise those two
-    down tensors in the packer.
-  - Done when `ds4_testpack.py`'s down substitution is not needed.
+- [ ] **3. MXFP4 mixed with the I-quants (the real pack has it).** *Written down 2026-10-24, not started.*
+  - From the GGUF: layers 26 and 42 of UD-IQ2_XXS are **IQ2_S (26) / IQ2_XXS (42) gate and up with an MXFP4 down**;
+    every other layer has one type for all three roles (IQ3_XXS down beside IQ2_XXS gate/up is common and already
+    works - `lay.K[r]` is per role).
+  - Blocked in two places: `expert_layout_mx` refuses MXFP4 beside the i-quants ("MXFP4 does not mix with the
+    others"), and every dispatch asks `gg::mx_experts(lay)`, which means all three roles MXFP4 (`gg::expert_type`
+    already answers per role).
+  - Device kernels: both families take the same activations - `q8_quant`'s `xq`/`xd` for gate/up and `hq`/`hd` for
+    the down - and read `lay.K[r]`, so the work is one dispatch per stage instead of one per layer:
+    `moe_gate_up`, `moe_down`, `win_experts` (gate/up and down in one call), `set_gate_up` and `set_down`.
+  - CPU lane: the two lanes differ in their activation quantizer (`gg::mx_quant` vs `gg::iq_cpu_quant`) and row
+    stride, so split `cpu_experts_mx` / `cpu_experts_iq` into a gate/up half (x -> h, the swiglu) and a down half
+    (h -> y) and run one of each for a mixed layer; an entry's token batch becomes
+    `min(gg::kMxCpuMaxN, kEntMax)` (see `ent_cap`).
+  - Then: build the pack with `pack_gguf.py` alone (no `ds4_testpack.py`), `smoke.py`, then item 4 - the first time
+    the engine's own numbers can be compared with llama.cpp.
 
 - [ ] **4. Validation against llama.cpp.**
   - A fixed token sequence, `--dump-logits` from the engine, llama.cpp's logits for the same ids (the pinned
