@@ -196,10 +196,22 @@ token's logits cos 0.9971 (window) and 0.9959 (chunk) with llama.cpp's argmax (5
 of a spread of about 18) are the engine's FP8 rounding of the window's rows and of the attention output: DeepSeek's
 inference rounds them (the reference's `act_quant`), llama.cpp does not.
 
-Speed on the same box (UD-IQ2_XXS, `--dspark none`, 24 CPU threads, the expert profile and the 48 GB RAM store that
-`strata launch` would give it): a 48-token answer decoded at 6.3 tokens/s, 272 MB read from the disk a token, 9007 of
-its 12126 routed experts on the CPU lane.  The first 4096-token measurement of this branch (33 tokens/s) was taken
-while bug 3 was silencing the CPU lane, so it is not a speed this model can run at.
+Speed on this box (UD-IQ2_XXS, 24 CPU threads, 8192 context, no drafter; 701 of 11008 experts in the 16 GiB card's
+memory, the rest on the CPU lane).  All after bug 3, so the CPU lane really runs:
+
+| run | tokens | speed | disk read a token | RAM store |
+|---|---:|---:|---:|---|
+| a build compiling on the same cores | 4096 | 8.17 tokens/s | 125 MB | 48 GB (90.6% hits) |
+| the box to itself | 512 | 9.26 tokens/s | 133 MB | 48 GB (88.0% hits) |
+| the box to itself, `--ssd-cache 64` | 256 | 9.68 tokens/s | 79 MB | 64 GB (93.2% hits) |
+
+The per-token budget is the CPU lane (76-115 ms, 143 of 258 routed experts a token) and the disk behind it; the layers
+themselves are 7.8 ms.  The RAM store is worth sizing: with 64 GB the reads nearly halve.  The store's contents come
+from `expert-profile.bin`, which the engine rewrites at the end of every run: a pack whose profile was built from a few
+one-token runs holds the wrong experts and streams four times as much, so profile it with a few thousand tokens first.
+`--dspark on` is not usable for this model yet: 255 rounds, 0 drafts offered, and it costs 11 ms a round (7.0
+tokens/s).  The earlier 33 tokens/s figure was taken while bug 3 was silencing the CPU lane - not a speed this model
+can run at.
 
 ## The model
 
