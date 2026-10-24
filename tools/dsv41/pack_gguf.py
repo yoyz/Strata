@@ -115,6 +115,13 @@ LAYER = {
     "attn_compressor_kv.weight": "attn.compressor.wkv.weight",
     "attn_compressor_gate.weight": "attn.compressor.wgate.weight",
     "attn_compressor_norm.weight": "attn.compressor.norm.weight",
+    # DeepSeek-V4-Flash-0731 (deepseek4): the compressor's learned absolute-position table, and the indexer's own
+    # compressor (it compresses its 128-wide keys itself instead of reading a source layer's)
+    "attn_compressor_ape.weight": "attn.compressor.ape",
+    "indexer_compressor_ape.weight": "attn.indexer.compressor.ape",
+    "indexer_compressor_kv.weight": "attn.indexer.compressor.wkv",
+    "indexer_compressor_gate.weight": "attn.indexer.compressor.wgate",
+    "indexer_compressor_norm.weight": "attn.indexer.compressor.norm",
     "indexer.attn_q_b.weight": "attn.indexer.wq_b.weight",
     "indexer.attn_k.weight": "attn.indexer.wk.weight",
     "indexer.k_norm.weight": "attn.indexer.k_norm.weight",
@@ -132,6 +139,7 @@ LAYER = {
     "ffn_gate_shexp.weight": "ffn.shared_experts.w1.weight",
     "ffn_up_shexp.weight": "ffn.shared_experts.w3.weight",
     "ffn_down_shexp.weight": "ffn.shared_experts.w2.weight",
+    "ffn_gate_tid2eid.weight": "ffn.gate.tid2eid",        # deepseek4: token id -> its experts (I32; the hash layers)
     "ffn_gate_exps.weight": "ffn.experts.w1",             # [n_exp][ff][dim]: one entry an expert
     "ffn_up_exps.weight": "ffn.experts.w3",
     "ffn_down_exps.weight": "ffn.experts.w2",             # [n_exp][dim][ff]
@@ -143,7 +151,10 @@ LAYER = {
     "engram_q.weight": "engram.q_weight",
     "engram_k.weight": "engram.k_weight",
 }
-GLOBAL = {"token_embd.weight": "embed.weight", "output_norm.weight": "norm.weight", "output.weight": "head.weight"}
+GLOBAL = {"token_embd.weight": "embed.weight", "output_norm.weight": "norm.weight", "output.weight": "head.weight",
+          # deepseek4: the head's hyper-connections (the engine has them inside layers only, so far)
+          "output_hc_fn.weight": "head.hc_fn", "output_hc_base.weight": "head.hc_base",
+          "output_hc_scale.weight": "head.hc_scale"}
 
 
 ALIASES = {
@@ -336,9 +347,12 @@ def is_engram_file(g) -> bool:
     return arch == "engram" or arch.endswith("-engram")
 
 
+MODEL_ARCHS = ("deepseek41", "deepseek4")   # deepseek4: DeepSeek-V4-Flash-0731 (a port in progress, see docs/DEEPSEEK41.md)
+
+
 def model_kv(gs):
-    """The metadata of the model: of the first group whose architecture IS deepseek41 - never an Engram file's, whatever order they come in."""
-    return next((g.kv for g in gs if g.kv.get("general.architecture") == "deepseek41"), None)
+    """The metadata of the model: of the first group whose architecture IS one of MODEL_ARCHS - never an Engram file's, whatever order they come in."""
+    return next((g.kv for g in gs if g.kv.get("general.architecture") in MODEL_ARCHS), None)
 
 
 def engram_set(model: pathlib.Path, explicit: str | None):
@@ -370,7 +384,10 @@ def write_engram(out: pathlib.Path, kv: dict, vocab: int):
     a = kv["general.architecture"]
     g = lambda k, d=None: kv.get("%s.%s" % (a, k), d)  # noqa: E731
     layers = list(g("engram.layers", []))
-    if not layers:
+    if not layers:   # a model without the n-gram table (deepseek4) still needs the file the engine opens
+        with out.open("wb") as f:
+            f.write(struct.pack("<4s6i", b"DSE1", vocab, 0, 0, 0, 0, 0))
+            f.write(struct.pack("<%di" % vocab, *([0] * vocab)))
         return 0, 0
     ngram, heads, hd = g("engram.max_ngram_size"), g("engram.head_count"), g("engram.head_dim")
     tm = list(g("engram.token_map"))
@@ -404,7 +421,8 @@ def write_tokenizer(out: pathlib.Path, kv: dict, template: str | None):
     (out / "token_type.json").write_text(json.dumps([int(t) for t in types]))
     special = {"bos": int(kv.get("tokenizer.ggml.bos_token_id", 0)), "eos": int(kv.get("tokenizer.ggml.eos_token_id", 1)),
                "pad": int(kv.get("tokenizer.ggml.padding_token_id", 2))}
-    (out / "tokenizer.json").write_text(json.dumps({"pre": "deepseek3", "special_ids": special}, indent=1))
+    pre = kv.get("tokenizer.ggml.pre") or "deepseek3"   # deepseek4 states "joyai-llm"; the server's splitter takes it from here
+    (out / "tokenizer.json").write_text(json.dumps({"pre": pre, "special_ids": special}, indent=1))
     if template:
         (out / "chat_template.jinja").write_text(template, encoding="utf-8")
 
@@ -484,6 +502,16 @@ def main() -> int:
     # Looked for only when the quant's shards leave some out.
     have = {t[0] for g in gs for t in g.tensors}
     arch = kv["general.architecture"]
+    # deepseek4 (V4-Flash-0731) names no KV / indexer sources: every layer that carries a compressor owns its own
+    # compressed KV (V4.1 shares one source for each ratio).  The indexer's sources stay the layers that still carry
+    # the old indexer.attn_k: V4-Flash's indexer compresses its own keys (indexer_compressor_*) and the engine does not
+    # read them yet, so none is declared and the compressed rows are read without an index selection.
+    if arch == "deepseek4":
+        cr = list(kv.get(arch + ".attention.compress_ratios", []))
+        nl = int(kv.get(arch + ".block_count", 0))
+        kv.setdefault(arch + ".attention.kv_source_layers", [il for il, r in enumerate(cr[:nl]) if r > 0])
+        kv.setdefault(arch + ".attention.indexer.source_layers",
+                      sorted({int(n.split(".")[1]) for n in have if n.endswith(".indexer.attn_k.weight")}))
     int_tensors_to_engram(gs, kv)
     layers = kv.get("%s.engram.layers" % arch, [])
     # An official IST-DAS set (helcig/tmp-oct26-2) carries the Engram gate/kv as their own k, q, wkv tensors and a 3-D attn_output_a, and the
@@ -707,7 +735,10 @@ def main() -> int:
                 "output_norm.weight": "mtp.%d.norm.weight" % (nb - 1),
                 "conf_proj.weight": "mtp.%d.confidence_head.proj.weight" % (nb - 1),
                 "markov_w1.weight": "mtp.%d.markov_head.embed.weight" % (nb - 1),
-                "markov_w2.weight": "mtp.%d.markov_head.head.weight" % (nb - 1)}
+                "markov_w2.weight": "mtp.%d.markov_head.head.weight" % (nb - 1),
+                # deepseek4's drafter carries the head's hyper-connections too (the engine reads neither, yet)
+                "output_hc_fn.weight": "dspark.hc_fn.weight", "output_hc_base.weight": "dspark.hc_base.weight",
+                "output_hc_scale.weight": "dspark.hc_scale.weight"}
         groups = int(kv["%s.attention.output_group_count" % kv["general.architecture"]])
         bad = []
         for name, typ, dims, off in dg.tensors:

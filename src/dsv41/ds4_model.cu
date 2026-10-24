@@ -1581,6 +1581,12 @@ struct Model::Impl {
         CK(cudaMemcpy(p, v.data(), n * 4, cudaMemcpyHostToDevice));
         return true;
     }
+    bool zeros(Dev& d, float*& p, size_t n, std::string& err, size_t* acct) {
+        if (!dalloc(d, p, n, err, acct)) return false;
+        cudaSetDevice(d.id);
+        CK(cudaMemset(p, 0, n * 4));
+        return true;
+    }
     bool f16raw(Dev& d, const std::string& name, uint16_t*& p, std::string& err, size_t* acct) {
         const Tensor* t = pk.get(name);
         if (t != nullptr && (t->dtype == "F32" || t->dtype == "BF16" || t->dtype == "Q8_0")) {   // (a GGUF's)
@@ -3599,7 +3605,11 @@ struct Model::Impl {
                       f32(d, P + "hc_ffn_scale", l.hcf_scale, err, acct) &&
                       f32(d, P + "hc_ffn_base", l.hcf_base, err, acct) &&
                       f32(d, P + "ffn.gate.weight", l.gate_w, err, acct, (size_t) l.n_exp * g.dim) &&
-                      f32(d, P + "ffn.gate.bias", l.gate_bias, err, acct, (size_t) l.n_exp) &&
+                      // deepseek4's hash layers (the first hash_layer_count) have no learned router bias: zeros route like
+                      // llama.cpp's exp_probs_b = nullptr.  The hash table's own expert choice comes later.
+                      (pk.get(P + "ffn.gate.bias") != nullptr
+                           ? f32(d, P + "ffn.gate.bias", l.gate_bias, err, acct, (size_t) l.n_exp)
+                           : zeros(d, l.gate_bias, (size_t) l.n_exp, err, acct)) &&
                       (l.mtp || img_tok < 0 || pk.get(P + "ffn.gate.bias_vl") == nullptr ||
                        f32(d, P + "ffn.gate.bias_vl", l.gate_bias_vl, err, acct, (size_t) l.n_exp)) &&
                       mat(d, P + "ffn.shared_experts.w1", l.s1, err, acct, mi, nm, true, l.il % nm) &&
