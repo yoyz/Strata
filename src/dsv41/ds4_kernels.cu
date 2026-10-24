@@ -148,14 +148,14 @@ __global__ void __launch_bounds__(kThreads) finish_kernel(float* x, int len, lon
         r[j] = e < len ? v[e] : 0.0f;
         ss += r[j] * r[j];
     }
-    if (f.w != nullptr) {
+    if (f.w != nullptr || f.norm != 0) {
         const float tot = block_sum(ss);
         const float inv = rsqrtf(tot / (float) len + f.eps);
 #pragma unroll
         for (int j = 0; j < kFinMax; ++j) {
             if (j >= nj) break;
             const int e = threadIdx.x + j * kThreads;
-            if (e < len) r[j] = r[j] * inv * f.w[e];
+            if (e < len) r[j] = r[j] * inv * (f.w != nullptr ? f.w[e] : 1.0f);
         }
     }
     if (f.rd > 0) {

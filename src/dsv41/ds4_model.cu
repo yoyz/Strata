@@ -391,7 +391,7 @@ struct Pack {
 struct Geo {
     int vocab = 0, dim = 0, nl = 0, heads = 0, hd = 0, rd = 0, q_lora = 0, o_lora = 0, o_groups = 0, n_exp = 0,
         k_exp = 0, ff = 0, win = 0, hc = 0, sinkhorn = 0, ix_heads = 0, ix_hd = 0, ix_topk = 0, cand_src = -1,
-        cand_topk = 0, cand_blk = 0, orig_ctx = 0, eos = 1, hash_layers = 0;
+        cand_topk = 0, cand_blk = 0, orig_ctx = 0, eos = 1, hash_layers = 0, q_head_norm = 0, hc_lag = 1;
     float eps = 1e-20f, hc_eps = 1e-6f, route_scale = 1.0f, lim = 0.0f;
     double rope_theta = 1e4, comp_theta = 1e4, factor = 1.0, beta_fast = 32, beta_slow = 1;
     std::vector<int> ratios, kv_src, ix_src, eg_layers;
@@ -414,6 +414,11 @@ struct Geo {
         orig_ctx = (int) p.num("rope_scaling.original_max_position_embeddings", 0);
         eos = (int) p.num("eos_token_id", 1);
         hash_layers = (int) p.num("hash_layer_count", 0);   // deepseek4: the first layers route by token id
+        q_head_norm = (int) p.num("attn_q_head_norm", 0);   // deepseek4: a unit RMS norm a head on q (no weight)
+        // the two hyper-connection halves' pre-mixes: 1 (V4.1, Maya's model.py) the attention takes the previous
+        // layer's FFN pre-mix and the FFN this layer's attention pre-mix; 0 (V4-Flash-0731, as llama.cpp's graph has
+        // it) each half takes its own
+        hc_lag = (int) p.num("hc_lag", 1);
         eps = (float) p.num("rms_norm_eps", 1e-20), hc_eps = (float) p.num("hc_eps", 1e-6);
         route_scale = (float) p.num("routed_scaling_factor", 1.0), lim = (float) p.num("swiglu_limit", 0.0);
         rope_theta = p.num("rope_theta", 1e4), comp_theta = p.num("compress_rope_theta", 1e4);
@@ -1005,6 +1010,8 @@ struct Model::Impl {
     // a window of one through moe_gate_up / moe_down (DS4_MOE_TOKEN=0: win_experts, whose down rows run
     // before the wait for the CPU lane - the same bits, no faster)
     bool moe_token_path = std::getenv("DS4_MOE_TOKEN") == nullptr || std::atoi(std::getenv("DS4_MOE_TOKEN")) != 0;
+    const int* tk_src = nullptr;   // the chunk path's prompt ids (forward_chunks) and tk_src[0]'s position
+    int64_t tk_pos0 = 0;
     int async_max_t = std::getenv("DS4_ASYNC_T") ? std::atoi(std::getenv("DS4_ASYNC_T")) : 8;   // windows up to this
     // lookahead: while layer L runs, the device guesses the next layer's picks (its gate on L's FFN input, the same
     // choice) and publishes them with L's routing; the CPU lane asks for the guessed experts it will read from the files
@@ -1180,6 +1187,16 @@ struct Model::Impl {
     int attn_dump_layer = std::getenv("DS4_DUMP_ATTN") ? std::atoi(std::getenv("DS4_DUMP_ATTN")) : -1;
     std::FILE* attn_dump_f = [] {
         const char* v = std::getenv("DS4_DUMP_ATTN");
+        const char* f = v != nullptr ? std::strchr(v, ':') : nullptr;
+        return f != nullptr ? std::fopen(f + 1, "wb") : nullptr;
+    }();
+    // DS4_DUMP_FFN=<layer>:<file>: (debug, for the comparison with llama.cpp) one layer's feed-forward side, per token:
+    // int64 [il, T], the normed input (T x dim, llama.cpp's ffn_norm), the MoE's output (T x dim, ffn_out: the routed
+    // experts plus the shared one) and the shared expert's own output (T x dim, ffn_shexp; the chunk path adds it into
+    // the same buffer, so its third block is zero); the window path's async branch and both of the chunk path's
+    int ffn_dump_layer = std::getenv("DS4_DUMP_FFN") ? std::atoi(std::getenv("DS4_DUMP_FFN")) : -1;
+    std::FILE* ffn_dump_f = [] {
+        const char* v = std::getenv("DS4_DUMP_FFN");
         const char* f = v != nullptr ? std::strchr(v, ':') : nullptr;
         return f != nullptr ? std::fopen(f + 1, "wb") : nullptr;
     }();
@@ -2344,7 +2361,9 @@ struct Model::Impl {
                       dalloc(d, d.sh_out, W * D, err) && dalloc(d, d.cpu_part, W * D, err) &&
                       dalloc(d, d.freqs_win, 64, err) && dalloc(d, d.freqs_comp, 64, err) &&
                       dalloc(d, d.topk, W * topk_stride(), err) && dalloc(d, d.cand, W * cand_stride(), err) &&
-                      dalloc(d, d.tok, 16, err) && dalloc(d, d.tids, W, err) && dalloc(d, d.emb_rows, W * D, err) &&
+                      dalloc(d, d.tok, 16, err) &&
+                      dalloc(d, d.tids, std::max<size_t>((size_t) kWin, (size_t) chunk), err) &&
+                      dalloc(d, d.emb_rows, W * D, err) &&
                       dalloc(d, d.ext, ((size_t) g.win + W) * g.hd, err) && dalloc(d, d.xe, P * D, err) &&
                       dalloc(d, d.xg, P * g.ff, err) && dalloc(d, d.xu, P * g.ff, err) && dalloc(d, d.xhh, P * g.ff, err) &&
                       dalloc(d, d.ed, P * D, err) && dalloc(d, d.plan_ptr, P, err) &&
@@ -5692,7 +5711,7 @@ struct Model::Impl {
     // quantized once to the weight type's activation (Q8_K) in its c_xh row's bytes, then (h whole) its h the same
     void cpu_experts_iq(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord,
                         bool gu = true, bool down = true) {
-        if ((gu && !gg::mx_role(l.lay, 0)) || (down && !gg::mx_role(l.lay, 2))) return;   // (the dispatcher's choice)
+        if ((gu && gg::mx_role(l.lay, 0)) || (down && gg::mx_role(l.lay, 2))) return;   // (this lane's stages only)
         constexpr int RB = 64;   // rows a job
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH;
         const int GB = (FFh + RB - 1) / RB, DB = (Eh + RB - 1) / RB, ne = (int) ents.size();
@@ -6975,7 +6994,7 @@ struct Model::Impl {
         // attention
         if (!hc_mix_chunk(d, c, c.h, l.hca_fn, T, c.mix, err)) return false;
         hc_split(c.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, c.a_pre, c.a_post, c.a_comb, s);
-        hc_pre_norm(c.h, c.pre, l.attn_norm, D, H, T, g.eps, c.x, s);
+        hc_pre_norm(c.h, g.hc_lag ? c.pre : c.a_pre, l.attn_norm, D, H, T, g.eps, c.x, s);
         x3::rows_f16(c.x, D, nullptr, T, D, c.x16, s);
         prof_mark(d, 5);
         if (!kv_only && (!gemm(d, c, l.wq_a, c.x16, D, T, c.qr, g.q_lora, 0.0f, err) ||
@@ -7191,6 +7210,7 @@ struct Model::Impl {
             const int na = std::min(c.A, T - a0);
             if (!gemm(d, c, l.wq_b, c.qr16 + (size_t) a0 * g.q_lora, g.q_lora, na, c.q, HQ, 0.0f, err)) return false;
             Finish fr;
+            fr.norm = g.q_head_norm;   // (deepseek4: a unit RMS norm a head, no weight - llama.cpp's ggml_rms_norm(q))
             fr.rd = g.rd;
             fr.pos = (int) (p0 + a0);
             fr.vpp = NHL;
@@ -7228,21 +7248,30 @@ struct Model::Impl {
             if (!gemm(d, c, l.wo_b, c.oa16, OG * g.o_lora, na, c.acc + (size_t) a0 * D, D, 0.0f, err)) return false;
         }
         if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
+        if (attn_dump_f != nullptr && l.il == attn_dump_layer) {   // (debug) the attention output, before hc_post
+            std::vector<float> av((size_t) T * D);
+            CK(cudaMemcpyAsync(av.data(), c.acc, av.size() * 4, cudaMemcpyDeviceToHost, s));
+            CK(cudaStreamSynchronize(s));
+            std::fwrite(av.data(), 4, av.size(), attn_dump_f);
+            std::fflush(attn_dump_f);
+        }
         hc_post_inplace(c.acc, c.h, c.a_post, c.a_comb, D, H, T, s);
         prof_mark(d, 1);
         // the MoE
         if (!hc_mix_chunk(d, c, c.h, l.hcf_fn, T, c.mix, err)) return false;
         hc_split(c.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, c.f_pre, c.f_post, c.f_comb, s);
-        hc_pre_norm(c.h, c.a_pre, l.ffn_norm, D, H, T, g.eps, c.x, s);
+        hc_pre_norm(c.h, g.hc_lag ? c.a_pre : c.f_pre, l.ffn_norm, D, H, T, g.eps, c.x, s);
         x3::rows_f16(c.x, D, nullptr, T, D, c.x16, s);
         gemv_f32(l.gate_w, c.x, l.n_exp, D, T, c.glog, 1024, s);   // (F32 x: the token path's bits)
         for (int r0 = 0; r0 < T; r0 += kVlRows) {   // (route()'s image bits cover kVlRows rows a call)
             const int nr = std::min(kVlRows, T - r0);
             VlBits vb;
             const bool vl = l.gate_bias_vl != nullptr && vl_bits(p0 + r0, nr, vb);
+            if (l.tid2eid != nullptr)   // (the hash layers: this slab's token ids)
+                CK(cudaMemcpyAsync(d.tids, tk_src + (p0 - tk_pos0) + r0, (size_t) nr * 4, cudaMemcpyHostToDevice, s));
             route(c.glog + (size_t) r0 * 1024, l.gate_bias, l.n_exp, l.k_exp, nr, g.route_scale,
                   c.ridx + (size_t) r0 * kPicks, c.rw + (size_t) r0 * kPicks, s, l.gate_bias_vl, vl ? &vb : nullptr,
-                  d.tids + r0, l.mtp ? nullptr : l.tid2eid);
+                  d.tids, l.mtp ? nullptr : l.tid2eid);
         }
         const int n_vs = L0.n_slots + (int) L0.host_list.size();
         CK(cudaMemcpyAsync(l.vs_dev, l.vs_pin, (size_t) l.n_exp * 4, cudaMemcpyHostToDevice, s));   // (this member's)
@@ -7347,7 +7376,31 @@ struct Model::Impl {
         if (c.flow) {
             if (!flow_layer(d, c, L0, mi, wp.k, T, b, err)) return false;
             if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
-            hc_post_inplace(c.acc, c.h, c.f_post, c.f_comb, D, H, T, s);
+            if (ffn_dump_f != nullptr && l.il == ffn_dump_layer) {   // (debug) the FFN's input and output
+                const int64_t hdr[2] = {l.il, T};
+                std::vector<float> b((size_t) T * D * 3);
+                float* pb = b.data();
+                CK(cudaMemcpyAsync(pb, c.x, (size_t) T * D * 4, cudaMemcpyDeviceToHost, s));
+                CK(cudaMemcpyAsync(pb + (size_t) T * D, c.acc, (size_t) T * D * 4, cudaMemcpyDeviceToHost, s));
+                std::fill(pb + (size_t) T * D * 2, pb + (size_t) T * D * 3, 0.0f);   // (the chunk path adds it into c.acc)
+                CK(cudaStreamSynchronize(s));
+                std::fwrite(hdr, 8, 2, ffn_dump_f);
+                std::fwrite(pb, 4, b.size(), ffn_dump_f);
+                std::fflush(ffn_dump_f);
+            }
+            if (ffn_dump_f != nullptr && l.il == ffn_dump_layer) {   // (debug) the FFN's input and output
+            const int64_t hdr[2] = {l.il, T};
+            std::vector<float> b((size_t) T * D * 3);
+            float* pb = b.data();
+            CK(cudaMemcpyAsync(pb, c.x, (size_t) T * D * 4, cudaMemcpyDeviceToHost, s));
+            CK(cudaMemcpyAsync(pb + (size_t) T * D, c.acc, (size_t) T * D * 4, cudaMemcpyDeviceToHost, s));
+            std::fill(pb + (size_t) T * D * 2, pb + (size_t) T * D * 3, 0.0f);   // (the chunk path adds it into c.acc)
+            CK(cudaStreamSynchronize(s));
+            std::fwrite(hdr, 8, 2, ffn_dump_f);
+            std::fwrite(pb, 4, b.size(), ffn_dump_f);
+            std::fflush(ffn_dump_f);
+        }
+        hc_post_inplace(c.acc, c.h, c.f_post, c.f_comb, D, H, T, s);
             CK(cudaMemcpyAsync(c.pre, c.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
             prof_mark(d, 3);
             return true;
@@ -7375,6 +7428,18 @@ struct Model::Impl {
         }
         if (!run_set(d, c, l, l.vram_base, 0, unit(l), c.bounds, b.data(), v_done, L0.n_slots, T, err)) return false;
         if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
+        if (ffn_dump_f != nullptr && l.il == ffn_dump_layer) {   // (debug) the FFN's input and output
+            const int64_t hdr[2] = {l.il, T};
+            std::vector<float> b((size_t) T * D * 3);
+            float* pb = b.data();
+            CK(cudaMemcpyAsync(pb, c.x, (size_t) T * D * 4, cudaMemcpyDeviceToHost, s));
+            CK(cudaMemcpyAsync(pb + (size_t) T * D, c.acc, (size_t) T * D * 4, cudaMemcpyDeviceToHost, s));
+            std::fill(pb + (size_t) T * D * 2, pb + (size_t) T * D * 3, 0.0f);   // (the chunk path adds it into c.acc)
+            CK(cudaStreamSynchronize(s));
+            std::fwrite(hdr, 8, 2, ffn_dump_f);
+            std::fwrite(pb, 4, b.size(), ffn_dump_f);
+            std::fflush(ffn_dump_f);
+        }
         hc_post_inplace(c.acc, c.h, c.f_post, c.f_comb, D, H, T, s);
         CK(cudaMemcpyAsync(c.pre, c.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
         prof_mark(d, 3);
@@ -8138,6 +8203,8 @@ struct Model::Impl {
     // the last min(logits_rows, 16) rows (logits_rows > 16: a run of one chunk, every row's into chunk_logits)
     bool forward_chunks(const int* tk, int n, int logits_rows, std::string& err, int snap_slot = -1) {
         if (n < 1) return true;
+        tk_src = tk;   // (the chunk path's ids, for the hash layers' routing: tk_pos0 is tk[0]'s position)
+        tk_pos0 = pos;
         if (pos + n > o.max_context) {
             err = "the context is full";
             return false;
@@ -8811,7 +8878,7 @@ struct Model::Impl {
         // attention
         hc_mix(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, s);
         hc_split(d.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, d.a_pre, d.a_post, d.a_comb, s);
-        hc_pre_norm(d.h, d.pre, l.attn_norm, D, H, T, g.eps, d.x, s);
+        hc_pre_norm(d.h, g.hc_lag ? d.pre : d.a_pre, l.attn_norm, D, H, T, g.eps, d.x, s);
         {
             x3::MvJob j[4];
             int nj = 0;
@@ -8828,6 +8895,7 @@ struct Model::Impl {
         if (NHL > 0) {
             if (!mv(d, {job(l.wq_b, d.qr, d.q, T, g.q_lora, HQ)}, err)) return false;
             Finish fr;
+            fr.norm = g.q_head_norm;   // (deepseek4: a unit RMS norm a head, no weight - llama.cpp's ggml_rms_norm(q))
             fr.rd = g.rd;
             fr.pos = (int) p0;
             fr.vpp = NHL;
@@ -9070,7 +9138,7 @@ struct Model::Impl {
         // the MoE
         hc_mix(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, s);
         hc_split(d.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, d.f_pre, d.f_post, d.f_comb, s);
-        hc_pre_norm(d.h, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.x, s);
+        hc_pre_norm(d.h, g.hc_lag ? d.a_pre : d.f_pre, l.ffn_norm, D, H, T, g.eps, d.x, s);
         if (wp.async) {
             // the routing goes to the service thread through the mailbox (a group's lead publishes it, the members
             // make the same plan) while the device runs the shared expert and the VRAM experts (from the plan the
@@ -9161,6 +9229,18 @@ struct Model::Impl {
             }
             if (lead) st.experts += (int64_t) T * l.k_exp;
             if (nm > 1) allreduce(d.moe_out, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
+            if (ffn_dump_f != nullptr && l.il == ffn_dump_layer) {   // (debug) the FFN's input and output
+                const int64_t hdr[2] = {l.il, T};
+                std::vector<float> b((size_t) T * D * 3);
+                float* pb = b.data();
+                CK(cudaMemcpyAsync(pb, d.x, (size_t) T * D * 4, cudaMemcpyDeviceToHost, s));
+                CK(cudaMemcpyAsync(pb + (size_t) T * D, d.moe_out, (size_t) T * D * 4, cudaMemcpyDeviceToHost, s));
+                CK(cudaMemcpyAsync(pb + (size_t) T * D * 2, d.sh_out, (size_t) T * D * 4, cudaMemcpyDeviceToHost, s));
+                CK(cudaStreamSynchronize(s));
+                std::fwrite(hdr, 8, 2, ffn_dump_f);
+                std::fwrite(pb, 4, b.size(), ffn_dump_f);
+                std::fflush(ffn_dump_f);
+            }
             hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
             std::swap(d.h, d.h2);
             CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));

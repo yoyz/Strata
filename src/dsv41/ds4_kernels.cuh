@@ -48,6 +48,7 @@ struct Finish {
     const float* w = nullptr;
     float eps = 1e-20f;
     int rd = 0, pos = 0, inverse = 0, vpp = 1, pos_step = 1;
+    int norm = 0;                   // (rms-normalize even without a weight: deepseek4's per-head q norm has none)
     const float* freqs = nullptr;   // rd / 2 values
     int quant = 0;
     uint16_t* dst = nullptr;

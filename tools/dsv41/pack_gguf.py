@@ -227,6 +227,13 @@ def geometry(kv: dict, vocab: int) -> dict:
         "index_source_layer_ids": list(g("attention.indexer.source_layers", [])),
         "engram_layer_ids": list(g("engram.layers", [])),
         "hash_layer_count": g("hash_layer_count"),
+        # deepseek4 (V4-Flash-0731): q gets a unit RMS norm a head after wq_b, which has no weight (llama.cpp's
+        # ggml_rms_norm(q)); V4.1's packs do not carry this key and keep the plain wq_b output.
+        "attn_q_head_norm": 1 if a == "deepseek4" else None,
+        # deepseek4's hyper-connections have no lag: each half (attention, FFN) takes its own pre-mix, as llama.cpp's
+        # graph does. V4.1's packs keep the lagged pre-mix (Maya's model.py): the attention takes the previous layer's
+        # FFN pre-mix and the FFN this layer's attention pre-mix.
+        "hc_lag": 0 if a == "deepseek4" else None,
         "max_position_embeddings": g("context_length"),
         "dspark_block_size": g("dspark.block_size", 0),
         "dspark_noise_token_id": g("dspark.noise_token_id", 0),
