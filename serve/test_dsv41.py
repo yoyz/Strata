@@ -599,6 +599,24 @@ class Api(ApiBase):
         self.assertEqual(req, {})
 
 
+class DoneLine(unittest.TestCase):
+    """The engine's DONE line's key=value fields: the expert cache's swap count (cumulative) is one of them."""
+
+    def engine(self, line):
+        from serve.server import StrataEngine
+        e = StrataEngine.__new__(StrataEngine)
+        e._parse_done(line)
+        return e
+
+    def test_the_swap_count_is_read(self):
+        e = self.engine("DONE 10 100 12.0 345.0 stop 0 0 0 0 0 swaps=42")
+        self.assertEqual((e.last["generated"], e.last["swaps"]), (10, 42))
+
+    def test_an_engine_that_does_not_say_has_no_field(self):
+        e = self.engine("DONE 10 100 12.0 345.0 stop 0 0 0 0 0")
+        self.assertNotIn("swaps", e.last)
+
+
 class SlotEnv(unittest.TestCase):
     """The engine's kept conversations: the folder and the switch reach the DeepSeek engine only."""
 

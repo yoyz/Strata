@@ -1346,9 +1346,9 @@ class StrataEngine:
             self.last.update(prompt_read=int(f[14]))
         if len(f) >= 16:                                  # #588 (engine 0.1.39+): routed experts read over PCIe
             self.last.update(offloaded=int(f[15]))
-        for tok in f[16:]:                                # key=value fields after the positional ones (the prompt's
-            key, eq, value = tok.partition("=")           # first chunk and its streamed expert blobs)
-            if eq and key in ("chunk", "experts_streamed"):
+        for tok in f[11:]:                                # key=value fields after the positional ones (the prompt's
+            key, eq, value = tok.partition("=")           # first chunk and its streamed expert blobs; the expert
+            if eq and key in ("chunk", "experts_streamed", "swaps"):   # cache's moves into VRAM, cumulative)
                 try:
                     self.last[key] = int(value)
                 except ValueError:
@@ -5519,6 +5519,9 @@ class Service:
                                 if n and last.get("generated") and last.get("decode_ms") else None,
                                 "hit_rate": hit_rate, "pcie_share": pcie_share, "ram_blobs": last.get("ram_blobs"),
                                 "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
+                                # the expert cache's moves into VRAM, cumulative since the engine started (a request's
+                                # delta is this line's value against the one before it); None: an engine that does not say
+                                "swaps": last.get("swaps"),
                                 # #457: the speculative drafts from the DONE line (None: the engine did not say)
                                 "drafts_offered": last.get("drafts_offered"),
                                 "drafts_accepted": last.get("drafts_accepted")})
