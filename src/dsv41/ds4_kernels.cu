@@ -535,34 +535,54 @@ __global__ void swiglu_kernel(const float* __restrict__ g, const float* __restri
 }
 
 // ---------------------------------------------------------------- the compressor (ratio > 1), a window in order
+// One state row a token (coff * d values, a ring of `slots` rows at slot = pos % slots).  A completed group pools the
+// rows the group reads - its own (coff 1), or the previous group's first halves and its own second halves (coff 2) -
+// with a softmax over them per value, then rmsnorm(w).  The score carries the position table (ape[slot % ratio]).
 __global__ void __launch_bounds__(512) compress_kernel(const float* __restrict__ kv, const float* __restrict__ score,
-                                                       float* kv_state, float* score_state, int ratio, int p0, int T,
-                                                       int d, const float* __restrict__ w, float eps,
+                                                       float* kv_state, float* score_state, int ratio, int coff,
+                                                       int slots, int p0, int T, int d, const float* __restrict__ w,
+                                                       float eps, const float* __restrict__ ape,
                                                        float* __restrict__ latent) {
+    const int wide = coff * d;
     int g = 0;
     for (int t = 0; t < T; ++t) {
-        const int slot = (p0 + t) % ratio;
-        const bool pool = (p0 + t + 1) % ratio == 0;
-        for (int e = threadIdx.x; e < d; e += blockDim.x) {
-            kv_state[(size_t) slot * d + e] = kv[(size_t) t * d + e];
-            score_state[(size_t) slot * d + e] = score[(size_t) t * d + e];
+        const int pos = p0 + t;
+        const int slot = pos % slots;
+        const float* ap = ape != nullptr ? ape + (size_t) (slot % ratio) * wide : nullptr;
+        for (int e = threadIdx.x; e < wide; e += blockDim.x) {
+            kv_state[(size_t) slot * wide + e] = kv[(size_t) t * wide + e];
+            score_state[(size_t) slot * wide + e] = score[(size_t) t * wide + e] + (ap != nullptr ? ap[e] : 0.0f);
         }
         __syncthreads();
-        if (!pool) continue;
-        // (kv * softmax(score, over the slots)).sum: each slot's probability first, then the sum, as torch does
+        if ((pos + 1) % ratio != 0) continue;
+        // the group's first position; coff 2 also reads the group before it (the sequence's first group has none)
+        const int b0 = pos + 1 - ratio;
+        const bool prev = coff > 1 && b0 >= ratio;
         float val[2] = {0.0f, 0.0f};   // d <= 2 * blockDim
         float ss = 0.0f;
         int n = 0;
         for (int e = threadIdx.x; e < d; e += blockDim.x, ++n) {
+            const int cs = coff > 1 ? d + e : e;   // (coff 2: the group's second half)
             float m = -FLT_MAX;
-            for (int s = 0; s < ratio; ++s) m = fmaxf(m, score_state[(size_t) s * d + e]);
-            float den = 0.0f;
-            for (int s = 0; s < ratio; ++s) den += expf(score_state[(size_t) s * d + e] - m);
-            float acc = 0.0f;
-            for (int s = 0; s < ratio; ++s)
-                acc += kv_state[(size_t) s * d + e] * (expf(score_state[(size_t) s * d + e] - m) / den);
-            val[n] = acc;
-            ss += acc * acc;
+            if (prev)
+                for (int i = 0; i < ratio; ++i) m = fmaxf(m, score_state[(size_t) ((b0 - ratio + i) % slots) * wide + e]);
+            for (int i = 0; i < ratio; ++i) m = fmaxf(m, score_state[(size_t) ((b0 + i) % slots) * wide + cs]);
+            float den = 0.0f, acc = 0.0f;
+            if (prev)
+                for (int i = 0; i < ratio; ++i) {
+                    const size_t o = (size_t) ((b0 - ratio + i) % slots) * wide + e;
+                    const float p = expf(score_state[o] - m);
+                    den += p;
+                    acc += p * kv_state[o];
+                }
+            for (int i = 0; i < ratio; ++i) {
+                const size_t o = (size_t) ((b0 + i) % slots) * wide + cs;
+                const float p = expf(score_state[o] - m);
+                den += p;
+                acc += p * kv_state[o];
+            }
+            val[n] = acc / den;
+            ss += val[n] * val[n];
         }
         const float inv = rsqrtf(block_sum(ss) / (float) d + eps);
         n = 0;
@@ -1974,9 +1994,11 @@ void swiglu(const float* g, const float* u, int n, float lim, float* h, cudaStre
     if (n > 0) swiglu_kernel<<<cdiv(n, kThreads), kThreads, 0, s>>>(g, u, n, lim, h);
 }
 
-void compress_win(const float* kv, const float* score, float* kv_state, float* score_state, int ratio, int p0, int T,
-                  int d, const float* w, float eps, float* latent, cudaStream_t s) {
-    compress_kernel<<<1, 512, 0, s>>>(kv, score, kv_state, score_state, ratio, p0, T, d, w, eps, latent);
+void compress_win(const float* kv, const float* score, float* kv_state, float* score_state, int ratio, int coff,
+                  int slots, int p0, int T, int d, const float* w, float eps, const float* ape, float* latent,
+                  cudaStream_t s) {
+    compress_kernel<<<1, 512, 0, s>>>(kv, score, kv_state, score_state, ratio, coff, slots, p0, T, d, w, eps, ape,
+                                      latent);
 }
 
 void index_score(const float* q, const float* w, const void* k, int heads, int hd, int T, int n, const int* cand,

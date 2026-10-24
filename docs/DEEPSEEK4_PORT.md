@@ -1,8 +1,8 @@
 # Porting the DeepSeek engine to DeepSeek-V4-Flash-0731 (`deepseek4`)
 
 Status: **experimental, not usable.** The packer accepts the model, the engine loads it, and it decodes — with the
-wrong math, because two of the model's four differences are still missing. This note is the restart point: what is
-done, what is left, and how to build and run it.
+wrong math, because the indexer (item 2) and the real pack (item 3) are still missing. This note is the restart point:
+what is done, what is left, and how to build and run it.
 
 ## Where this stands
 
@@ -12,11 +12,19 @@ Branch `f-dsv41-ds4`, worktree `/mnt/nvme_lexar_0/ollama/.local/share/opencode/w
 |---|---|
 | `335fcfa1` | the packer accepts `deepseek4`; the engine loads and decodes a pack (test rewrites, below) |
 | `f66aafa4` | the head hyper-connection and the hash layers' routing |
+| `990bb791` | this note and the scripted test pack |
+| `this commit` | the compressor: two halves a row (CSA's overlap), the position table, and the ring that keeps a group across a chunk |
 
 Measured 2026-10-24, RX 9070 XT (16 GiB, gfx1201), 125 GiB RAM, one NVMe, the Qwen server stopped, the test pack
 (no expert profile, cold store): dense weights 6.7 s, whole load 12.6 s, 763 of 11,008 experts in VRAM (6.1 GB), the
 rest read in place from the files; a 3-token prompt in 2.24 s, then 2.27 tokens/s decoding, 1.33 GB read from the
-disk a token. Output is wrong: the compressor and the indexer below are not written.
+disk a token. Output is still wrong: the indexer below is not written, and the test pack's two substituted layers
+(item 3) put wrong values in two of the 43.
+
+The compressor is checked against a double reference written from llama.cpp's two compress graphs
+(`tests/dsv41/compress_test.cpp`, 7 runs: CSA with the table, without it, a token a call, several groups a call, V4.1's
+ratio 4, HCA ratio 128 and HCA across chunk boundaries): every group matches to 2e-5. Matching llama.cpp's own numbers
+end to end needs a real pack first (item 3), because 2 of the 43 layers still carry the test pack's substitution.
 
 Everything below marked *static* is read from the code, not measured on a card.
 
@@ -35,6 +43,10 @@ cmake -G Ninja -S . -B /mnt/nvme_lexar_0/ollama_user_cache/strata/build-dsv41 \
   -DSTRATA_GGML_DIR=/mnt/nvme_lexar_0/ollama/build/Strata-0.1.40.3/third_party/llama.cpp \
   -DSTRATA_NATIVE_EXPERTS=ON
 HIP_PLATFORM=amd ninja -j 12 -C /mnt/nvme_lexar_0/ollama_user_cache/strata/build-dsv41 strata-dsv41
+
+# the compressors against their double reference (one GPU, no model)
+HIP_PLATFORM=amd ninja -j 12 -C /mnt/nvme_lexar_0/ollama_user_cache/strata/build-dsv41 ds4_compress_test
+/mnt/nvme_lexar_0/ollama_user_cache/strata/build-dsv41/ds4_compress_test
 
 # the pack (3 MB of metadata; the 91 GB of weights stay where they are)
 python3 tools/dsv41/pack_gguf.py \
@@ -56,22 +68,20 @@ the comparison hooks for the validation step.
 
 ## To do
 
-- [ ] **1. The compressor: CSA (ratio 4) and HCA (ratio 128), with the position table.**
-  - `src/dsv41/ds4_kernels.cu`: `compress_kernel` / `compress_win`; `src/dsv41/ds4_kernels.cuh`.
-  - `src/dsv41/ds4_model.cu`: `Layer::c_kv`, `c_score`, `latent`; the compressor loads in `load_dense`; the calls at
-    the window path (`compress_win(...)`, one near line 6733) and the decode path (near 8611); `Src`/`cp_latent`.
-  - `coff = ratio == 4 ? 2 : 1`: `wkv`/`wgate` are `[dim, coff·head]`; `ape` is `[coff·head, ratio]`.
-  - score = `wgate(x) + ape[slot]`, slot = position in the group; softmax over the group's `2·ratio` (CSA) or
-    `ratio` (HCA) scores; weighted sum of the corresponding `head` values; RMS norm (`attn_compressor_norm`); RoPE
-    at the compressed positions with `compress_rope_freq_base` (160000).
-  - The ratio-4 state keeps `2·head` a token. A block b (tokens 4b … 4b+3) mixes the **first half** of the previous
-    block's four tokens with the **second half** of its own four tokens (llama.cpp's “overlap” compressor; the state
-    plan is in `llama-kv-cache-dsv4.cpp`, `dsv4_state_read_idxs()`, and the graph in
-    `build_overlap_compressed_kv_from_state`).
-  - *Static.* Reusing `Src` one source a layer (every ratio>0 layer is already one) should keep the per-layer
-    ownership; the kernel and the buffer widths are the work.
-  - Done when: a short prompt's compressed rows match llama.cpp's, and the removed compressor slice in
-    `ds4_testpack.py` no longer changes the tokens.
+- [x] **1. The compressor: CSA (ratio 4) and HCA (ratio 128), with the position table.** Done in this commit.
+  - `src/dsv41/ds4_kernels.cu`: `compress_kernel` / `compress_win` take `coff` and `slots`, write a token's whole
+    `coff · head` row (the position table added to the score as the row is written), pool a group over the rows it
+    reads - the previous group's first halves and its own second halves (CSA), or its own `ratio` rows (HCA, V4.1) -
+    per value, `acc / den`, then `rsqrt(mean + eps) · w`.
+  - `src/dsv41/ds4_model.cu`: `Layer::c_ape`, `c_coff`, `c_slots`, `c_wide`, `c_n()`; the pack's `attn.compressor.wkv`
+    row count decides `coff` (V4.1 512 → 1, deepseek4's ratio-4 1024 → 2; anything else is an error), the ring is
+    `coff · ratio` rows (2·ratio keeps the previous group until it has been read), the APE is loaded next to the
+    compressor's matrices, and every size that used `ratio · hd` (`reset`, the checkpoints, the slots, the speculative
+    window's snapshot of the state and its replay of the units' raw rows) uses `c_n()` / `c_wide`.
+  - Checked: `ds4_compress_test` (below). Not yet checked against llama.cpp: that needs a real pack (item 3), because
+    the test pack's two substituted layers sit in the middle of the 43 and everything after them is wrong.
+  - The doubt about `2·head` rows in `Src`: none needed - the pooled row is `head` wide and the source cache's rows
+    are unchanged; only the compressor's own state got wider.
 
 - [ ] **2. The indexer's own compressor (LID), 21 ratio-4 layers.**
   - Tensors already mapped: `attn.indexer.compressor.{wkv,wgate,ape,norm}` (`[dim, 2·128]`, `[256, 4]`, `[128]`).
@@ -103,14 +113,13 @@ the comparison hooks for the validation step.
 - [ ] **5. Not started, after the engine matches:** the model in `setup.py`/`strata_control` (family, pin, sizes),
   the server hand-off, and a `strata-dsv41` package for the feed.
 
-## Test-only rewrites in `ds4_testpack.py` (remove when 1 and 3 land)
+## Test-only rewrite in `ds4_testpack.py` (remove when item 3 lands)
 
 1. layers 26 and 42's down experts point at layer 25's / 41's (same shape, wrong values): the engine cannot mix
    MXFP4 with the I-quants.
-2. the ratio-4 compressor matrices are cut to their first 512 rows: the engine's compressor reads `head`, the model
-   stores `2·head`.
 
-Both are in `tensors.txt` only; the weights are not touched. A real pack must never be built this way.
+It is in `tensors.txt` only; the weights are not touched. A real pack must never be built this way. (The compressor
+matrices are read whole since item 1: `ds4_testpack.py` no longer cuts their first half away.)
 
 ## The model
 
@@ -134,7 +143,7 @@ arrives correctly — that is why the model loads.
 
 ## The four differences, in full
 
-### 1. Compressor: per layer, with the learned position table, and CSA's overlap
+### 1. Compressor: per layer, with the learned position table, and CSA's overlap — **done**
 
 V4.1: a few source layers own the compressed KV of a ratio; the following layers read it. The engine's
 `kv_source_layer_ids` model.
@@ -150,8 +159,11 @@ V4-Flash: every layer with `ratio > 0` has its own `attn_compressor_kv/gate/norm
   (softmax), sum to one `head` vector, RMS norm, RoPE. llama.cpp: `build_overlap_compressed_kv_from_state`, and the
   index plan in `dsv4_state_read_idxs` (`src/llama-kv-cache-dsv4.cpp`).
 
-The engine's `compress_win` does a softmax over `ratio` rows of `head` values with no position table, and its state
-is `ratio·head`; CSA needs `2·head` a token both in the state and in `ape`.
+The softmax is per value, over the rows a group reads - the engine's original `compress_win` already had that shape;
+what it lacked was the position table, a row of `2·head` on a ratio-4 layer (the first `head` values being what the
+next group reads as its previous half, the last `head` what its own group reads), and the `2·ratio` ring rows that
+keep the previous group until it has been read. `coff` comes from the pack (`attn.compressor.wkv`'s row count over
+`head`), so a V4.1 pack still runs the old shapes.
 
 ### 2. Indexer: it compresses its own keys
 
@@ -188,10 +200,13 @@ values, `sigmoid(scale·mix + base) + eps`, weighted sum, then `output_norm` and
 ## What the engine does with the pack today
 
 `strata-dsv41` reads `ds4.txt` + `tensors.txt`, places the dense weights and as many experts as VRAM holds, reads
-the rest in place from the GGUF, and runs the V4.1 graph: window + compressor + (no) indexer attention, hyper-
-connections per layer, MoE with top-k or the hash table, and the head with its hyper-connection. Because the
-compressor widths and the position table are V4.1's, every layer with `ratio > 0` is numerically wrong; the output
-cannot be compared with llama.cpp until item 1 lands.
+the rest in place from the GGUF, and runs the V4.1 graph with deepseek4's own compressor: window + the compressed
+rows (a layer's own, from the two halves of its group and the position table) + (no) indexer attention, hyper-
+connections per layer, MoE with top-k or the hash table, and the head with its hyper-connection. The indexer still
+reads the compressed rows without a selection (item 2: with every source visible it attends to all of them, which is
+right for the first 512 rows of a prompt and wrong past that), and the test pack's two substituted layers put wrong
+values in layers 26 and 42. So the output stays wrong until items 2 and 3 land; the compressor itself is checked
+against its double reference (`ds4_compress_test`), not yet against llama.cpp.
 
 ## Cautions
 

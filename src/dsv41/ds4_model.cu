@@ -648,7 +648,11 @@ struct Layer {
     float* gate_w = nullptr;   // the router's weights, F32 (DeepSeek's inference computes the gate in F32)
     int* tid2eid = nullptr;    // deepseek4's hash layers: [k_exp][vocab] token id -> expert id (I32), else nullptr
     uint8_t* win = nullptr;                     // [win] rows of kKvFp8 (kv_row_bytes)
-    float *c_kv = nullptr, *c_score = nullptr;  // the compressor's partial group (ratio > 1)
+    float *c_kv = nullptr, *c_score = nullptr;  // the compressor's partial group (ratio > 1): slots rows of c_wide
+    float* c_ape = nullptr;                     // deepseek4's compressor position table [ratio][c_wide] (else nullptr)
+    int c_coff = 1;                             // 2 on deepseek4's ratio-4 layers (CSA: two halves a row)
+    int c_slots = 0, c_wide = 0;                // the group's ring: c_slots rows of c_wide floats (c_coff * hd)
+    size_t c_n() const { return (size_t) c_slots * (size_t) c_wide; }
     // a run of chunks' mid-run checkpoint (feed_mark): the ring and the partial group as they were before a row
     uint8_t* snap_win = nullptr;
     float *snap_kv = nullptr, *snap_sc = nullptr;
@@ -2029,6 +2033,22 @@ struct Model::Impl {
             l.n_exp = l.mtp ? g.d_n_exp : g.n_exp;
             l.k_exp = l.mtp ? g.d_k : g.k_exp;
             l.ratio = g.ratios[(size_t) il];
+            l.c_wide = g.hd;
+            l.c_slots = l.ratio;
+            if (const Tensor* tw = pk.get(l.name + "attn.compressor.wkv.weight");
+                tw != nullptr && tw->shape.size() == 2 && g.hd > 0) {
+                // [outputs][inputs] in the pack (ggml's [n, k], reversed); a V4.1 pack's outputs are head, deepseek4's
+                // ratio-4 ones 2 * head
+                const size_t n = (size_t) g.dim == tw->shape[1] ? tw->shape[0] : tw->shape[1];
+                l.c_coff = (int) std::max<size_t>(1, std::min<size_t>(2, n / (size_t) g.hd));
+            }
+            if (l.c_coff > 1 && l.ratio != 4) {
+                err = l.name + ": a compressor of " + std::to_string(l.c_coff) + " halves on a ratio-" +
+                      std::to_string(l.ratio) + " layer is not covered (deepseek4's CSA is ratio 4)";
+                return false;
+            }
+            l.c_wide = l.c_coff * g.hd;
+            l.c_slots = l.c_coff * l.ratio;
             if (l.mtp) {   // window attention only: no compressor, indexer or Engram
                 if (l.ratio != 0 || l.n_exp <= 0 || l.k_exp <= 0 || l.k_exp > kPicks) {
                     err = l.name + ": a DSpark block of compress ratio " + std::to_string(l.ratio) + ", " +
@@ -2264,10 +2284,12 @@ struct Model::Impl {
             Dev& d = devs[di];
             const int D = g.dim, H = g.hc;
             const size_t W = kWin, P = (size_t) kWin * kPicks, cap = (size_t) o.max_context + 64;
+            int cw = g.hd;   // the compressor's widest row (deepseek4's CSA layers write two halves a token)
+            for (const Layer& l : L) cw = std::max(cw, l.c_wide);
             bool ok = dalloc(d, d.h, W * H * D, err) && dalloc(d, d.h2, W * H * D, err) && dalloc(d, d.x, W * D, err) &&
                       dalloc(d, d.qr, W * g.q_lora, err) && dalloc(d, d.q, W * g.heads * g.hd, err) &&
-                      dalloc(d, d.kvr, W * g.hd, err) && dalloc(d, d.ckr, W * g.hd, err) &&
-                      dalloc(d, d.cgr, W * g.hd, err) && dalloc(d, d.latent, W * g.hd, err) &&
+                      dalloc(d, d.kvr, W * g.hd, err) && dalloc(d, d.ckr, W * cw, err) &&
+                      dalloc(d, d.cgr, W * cw, err) && dalloc(d, d.latent, W * g.hd, err) &&
                       dalloc(d, d.ikr, W * g.ix_hd, err) && dalloc(d, d.iq, W * g.ix_heads * g.ix_hd, err) &&
                       dalloc(d, d.iw, W * 64, err) && dalloc(d, d.scores, W * cap, err) &&
                       dalloc(d, d.bm, W * bm_stride(), err) && dalloc(d, d.o, W * g.heads * g.hd, err) &&
@@ -2853,10 +2875,14 @@ struct Model::Impl {
                         stride = std::max(stride, align256(unit(member(l, m))));
                     }
             const size_t A = (size_t) c.A, AI = (size_t) c.AI, ss = (size_t) o.max_context + 64;
+            int cw = HD;   // the compressor's widest row over the layers of this device (CSA: 2 * head)
+            for (const Layer& l : L)
+                for (int m = 0; m < l.nm; ++m)
+                    if (member(l, m).dev == (int) di) cw = std::max(cw, l.c_wide);
             bool ok = dalloc(d, c.h, C * H * D, err) && dalloc(d, c.x, C * D, err) && dalloc(d, c.acc, C * D, err) &&
                       dalloc(d, c.x16, C * D, err) && dalloc(d, c.qr, C * g.q_lora, err) &&
                       dalloc(d, c.qr16, C * g.q_lora, err) && dalloc(d, c.kvr, C * HD, err) &&
-                      dalloc(d, c.ckr, C * HD, err) && dalloc(d, c.cgr, C * HD, err) &&
+                      dalloc(d, c.ckr, C * cw, err) && dalloc(d, c.cgr, C * cw, err) &&
                       dalloc(d, c.latent, (C + 2) * HD, err) && dalloc(d, c.lat16, (C + 2) * HD, err) &&
                       dalloc(d, c.ikr, (C + 2) * g.ix_hd, err) && dalloc(d, c.ext, ((size_t) g.win + C) * HD, err) &&
                       dalloc(d, c.q, A * HQ, err) && dalloc(d, c.o, A * HQ, err) && dalloc(d, c.o16, A * HQ, err) &&
@@ -3641,8 +3667,10 @@ struct Model::Impl {
                 const std::string C = A + "compressor.";
                 if (!mat(d, C + "wkv", l.c_wkv, err, acct) || !f32(d, C + "norm.weight", l.c_norm, err, acct)) return false;
                 if (l.ratio > 1 && !mat(d, C + "wgate", l.c_wgate, err, acct)) return false;
-                if (l.ratio > 1 && (!dalloc(d, l.c_kv, (size_t) l.ratio * g.hd, err) ||
-                                    !dalloc(d, l.c_score, (size_t) l.ratio * g.hd, err)))
+                if (l.ratio > 1 && pk.get(C + "ape") != nullptr &&
+                    !f32(d, C + "ape", l.c_ape, err, acct, (size_t) l.ratio * l.c_wide))
+                    return false;
+                if (l.ratio > 1 && (!dalloc(d, l.c_kv, l.c_n(), err) || !dalloc(d, l.c_score, l.c_n(), err)))
                     return false;
             }
             if (l.ix_src) {
@@ -3671,8 +3699,8 @@ struct Model::Impl {
             if (!dalloc(d, l.win, (size_t) g.win * win_rb(), err, &d.caches)) return false;
             if (g.n_mtp > 0 && !l.mtp) {
                 if (!dalloc(d, l.ring_bak, (size_t) kWin * win_rb(), err)) return false;
-                if (l.kv_src && l.ratio > 1 && (!dalloc(d, l.c_snap, (size_t) 2 * l.ratio * g.hd, err) ||
-                                                !dalloc(d, l.c_rows, (size_t) 2 * kWin * g.hd, err)))
+                if (l.kv_src && l.ratio > 1 && (!dalloc(d, l.c_snap, 2 * l.c_n(), err) ||
+                                                !dalloc(d, l.c_rows, (size_t) 2 * kWin * l.c_wide, err)))
                     return false;
             }
             if (!dalloc(d, l.vram_tab, (size_t) l.n_exp, err, acct)) return false;
@@ -4706,8 +4734,8 @@ struct Model::Impl {
                 Dev& d = devs[(size_t) l.dev];
                 cudaSetDevice(d.id);
                 cudaMemsetAsync(l.win, 0, (size_t) g.win * win_rb(), d.st);
-                if (l.c_kv) cudaMemsetAsync(l.c_kv, 0, (size_t) l.ratio * g.hd * 4, d.st);
-                if (l.c_score) cudaMemsetAsync(l.c_score, 0, (size_t) l.ratio * g.hd * 4, d.st);
+                if (l.c_kv) cudaMemsetAsync(l.c_kv, 0, l.c_n() * 4, d.st);
+                if (l.c_score) cudaMemsetAsync(l.c_score, 0, l.c_n() * 4, d.st);
             }
         for (Dev& d : devs) {
             cudaSetDevice(d.id);
@@ -4729,8 +4757,8 @@ struct Model::Impl {
             c.win[i].resize((size_t) g.win * win_rb());
             cudaMemcpyAsync(c.win[i].data(), l.win, c.win[i].size(), cudaMemcpyDeviceToHost, d.st);
             if (l.c_kv) {
-                c.comp[2 * i].resize((size_t) l.ratio * g.hd);
-                c.comp[2 * i + 1].resize((size_t) l.ratio * g.hd);
+                c.comp[2 * i].resize(l.c_n());
+                c.comp[2 * i + 1].resize(l.c_n());
                 cudaMemcpyAsync(c.comp[2 * i].data(), l.c_kv, c.comp[2 * i].size() * 4, cudaMemcpyDeviceToHost, d.st);
                 cudaMemcpyAsync(c.comp[2 * i + 1].data(), l.c_score, c.comp[2 * i + 1].size() * 4,
                                 cudaMemcpyDeviceToHost, d.st);
@@ -4777,7 +4805,7 @@ struct Model::Impl {
     }
     size_t check_bytes() const {
         size_t n = 16;
-        for (const Layer& l : L) n += (size_t) g.win * win_rb() + (l.c_kv ? 2 * (size_t) l.ratio * g.hd * 4 : 0);
+        for (const Layer& l : L) n += (size_t) g.win * win_rb() + (l.c_kv ? 2 * l.c_n() * 4 : 0);
         return n;
     }
 
@@ -4825,7 +4853,7 @@ struct Model::Impl {
     // the slot's bytes: the header, the tokens, every layer's ring and partial group, every source's rows, the end
     size_t slot_bytes() const {
         size_t n = 8 + 8 + slot_identity().size() + 8 + (size_t) pos * 4;
-        for (const Layer& l : L) n += 8 + (size_t) g.win * win_rb() + 8 + (l.c_kv ? 2 * (size_t) l.ratio * g.hd * 4 : 0);
+        for (const Layer& l : L) n += 8 + (size_t) g.win * win_rb() + 8 + (l.c_kv ? 2 * l.c_n() * 4 : 0);
         for (const Src& s : srcs) n += 8 + (size_t) src_rows(s) * (ckv_rb() + ik_rb());
         n += 8 + slot_checks().size() * check_bytes();   // (the checkpoints: what the slot can be taken back at)
         return n + 8;
@@ -4877,7 +4905,7 @@ struct Model::Impl {
                 return 0;
             }
             off += (size_t) wb;
-            const uint64_t cn = l.c_kv ? (uint64_t) l.ratio * (uint64_t) g.hd : 0;
+            const uint64_t cn = l.c_kv ? (uint64_t) l.c_n() : 0;
             put(&cn, 8);
             if (cn > 0) {
                 const size_t cb = (size_t) cn * 4;
@@ -4921,8 +4949,8 @@ struct Model::Impl {
                 for (size_t i = 0; i < L.size(); ++i) {
                     put(c.win[i].data(), (size_t) g.win * win_rb());
                     if (L[i].c_kv) {
-                        put(c.comp[2 * i].data(), (size_t) L[i].ratio * g.hd * 4);
-                        put(c.comp[2 * i + 1].data(), (size_t) L[i].ratio * g.hd * 4);
+                        put(c.comp[2 * i].data(), L[i].c_n() * 4);
+                        put(c.comp[2 * i + 1].data(), L[i].c_n() * 4);
                     }
                 }
             }
@@ -5014,7 +5042,7 @@ struct Model::Impl {
             off += (size_t) wb;
             std::memcpy(&cn, data + off, 8);
             off += 8;
-            if (cn != (l.c_kv ? (uint64_t) l.ratio * (uint64_t) g.hd : 0)) {
+            if (cn != (l.c_kv ? (uint64_t) l.c_n() : 0)) {
                 err = l.name + "compressor's group of another size";
                 return false;
             }
@@ -5099,7 +5127,7 @@ struct Model::Impl {
                 c.win.resize(L.size());
                 c.comp.resize(L.size() * 2);
                 for (size_t i = 0; i < L.size(); ++i) {
-                    const size_t wb = (size_t) g.win * win_rb(), cb = L[i].c_kv ? (size_t) L[i].ratio * g.hd * 4 : 0;
+                    const size_t wb = (size_t) g.win * win_rb(), cb = L[i].c_kv ? L[i].c_n() * 4 : 0;
                     if (!room(wb + 2 * cb)) {
                         err = "the slot is cut short";
                         return false;
@@ -6759,11 +6787,11 @@ struct Model::Impl {
                 Dev& d = devs[(size_t) l.dev];
                 if (l.c_snap != nullptr) {
                     cudaSetDevice(d.id);
-                    const size_t ns = (size_t) l.ratio * g.hd * 4;
+                    const size_t ns = l.c_n() * 4;
                     cudaMemcpyAsync(l.c_kv, l.c_snap, ns, cudaMemcpyDeviceToDevice, d.st);
-                    cudaMemcpyAsync(l.c_score, l.c_snap + (size_t) l.ratio * g.hd, ns, cudaMemcpyDeviceToDevice, d.st);
-                    compress_win(l.c_rows, l.c_rows + (size_t) kWin * g.hd, l.c_kv, l.c_score, l.ratio, (int) p0, keep,
-                                 g.hd, l.c_norm, g.eps, d.latent, d.st);
+                    cudaMemcpyAsync(l.c_score, l.c_snap + l.c_n(), ns, cudaMemcpyDeviceToDevice, d.st);
+                    compress_win(l.c_rows, l.c_rows + (size_t) kWin * l.c_wide, l.c_kv, l.c_score, l.ratio, l.c_coff,
+                                 l.c_slots, (int) p0, keep, g.hd, l.c_norm, g.eps, l.c_ape, d.latent, d.st);
                 }
             }
         pos = p0 + keep;
@@ -6818,8 +6846,8 @@ struct Model::Impl {
         if (!kv_only && (!gemm(d, c, l.wq_a, c.x16, D, T, c.qr, g.q_lora, 0.0f, err) ||
                          !gemm(d, c, l.wkv, c.x16, D, T, c.kvr, HD, 0.0f, err)))
             return false;
-        if (l.kv_src && !gemm(d, c, l.c_wkv, c.x16, D, T, c.ckr, HD, 0.0f, err)) return false;
-        if (l.kv_src && l.ratio > 1 && !gemm(d, c, l.c_wgate, c.x16, D, T, c.cgr, HD, 0.0f, err)) return false;
+        if (l.kv_src && !gemm(d, c, l.c_wkv, c.x16, D, T, c.ckr, l.c_wide, 0.0f, err)) return false;
+        if (l.kv_src && l.ratio > 1 && !gemm(d, c, l.c_wgate, c.x16, D, T, c.cgr, l.c_wide, 0.0f, err)) return false;
         prof_mark(d, 6);
         const bool snap = !kv_only && wp.snap_t >= 0 && mi == 0 && L0.snap_win != nullptr;
         if (!kv_only) {
@@ -6863,17 +6891,23 @@ struct Model::Impl {
                     finish(c.ckr, T, HD, HD, fc, s);
                     latent = c.ckr;
                 } else {
-                    if (snap && L0.snap_kv != nullptr) {   // (each slot: the latest row before snap_t that holds it)
+                    if (snap && L0.snap_kv != nullptr) {   // each slot: its latest row before snap_t
                         const int64_t ps = p0 + wp.snap_t;
-                        for (int sl = 0; sl < R; ++sl) {
-                            const int64_t q = ps - 1 - (((ps - 1 - sl) % R) + R) % R;
-                            const float* kv = q >= p0 ? c.ckr + (size_t) (q - p0) * HD : l.c_kv + (size_t) sl * HD;
-                            const float* sc = q >= p0 ? c.cgr + (size_t) (q - p0) * HD : l.c_score + (size_t) sl * HD;
-                            CK(cudaMemcpyAsync(L0.snap_kv + (size_t) sl * HD, kv, (size_t) HD * 4, cudaMemcpyDeviceToDevice, s));
-                            CK(cudaMemcpyAsync(L0.snap_sc + (size_t) sl * HD, sc, (size_t) HD * 4, cudaMemcpyDeviceToDevice, s));
+                        for (int i = 0; i < l.c_slots; ++i) {
+                            const int64_t q = ps - 1 - i;
+                            const int sl = (int) (((q % l.c_slots) + l.c_slots) % l.c_slots);
+                            const float* kv = q >= p0 ? c.ckr + (size_t) (q - p0) * l.c_wide
+                                                      : l.c_kv + (size_t) sl * l.c_wide;
+                            const float* sc = q >= p0 ? c.cgr + (size_t) (q - p0) * l.c_wide
+                                                      : l.c_score + (size_t) sl * l.c_wide;
+                            CK(cudaMemcpyAsync(L0.snap_kv + (size_t) sl * l.c_wide, kv, (size_t) l.c_wide * 4,
+                                               cudaMemcpyDeviceToDevice, s));
+                            CK(cudaMemcpyAsync(L0.snap_sc + (size_t) sl * l.c_wide, sc, (size_t) l.c_wide * 4,
+                                               cudaMemcpyDeviceToDevice, s));
                         }
                     }
-                    compress_win(c.ckr, c.cgr, l.c_kv, l.c_score, R, (int) p0, T, HD, l.c_norm, g.eps, c.latent, s);
+                    compress_win(c.ckr, c.cgr, l.c_kv, l.c_score, R, l.c_coff, l.c_slots, (int) p0, T, HD, l.c_norm,
+                                 g.eps, l.c_ape, c.latent, s);
                 }
             }
             const int clen_max = (int) ((p0 + T) / R);
@@ -7978,7 +8012,7 @@ struct Model::Impl {
                 Dev& d = devs[(size_t) l.dev];
                 if (l.snap_win == nullptr && !dalloc(d, l.snap_win, (size_t) g.win * win_rb(), err)) return false;
                 if (l.c_kv != nullptr && l.snap_kv == nullptr &&
-                    (!dalloc(d, l.snap_kv, (size_t) l.ratio * g.hd, err) || !dalloc(d, l.snap_sc, (size_t) l.ratio * g.hd, err)))
+                    (!dalloc(d, l.snap_kv, l.c_n(), err) || !dalloc(d, l.snap_sc, l.c_n(), err)))
                     return false;
             }
         }
@@ -8176,8 +8210,8 @@ struct Model::Impl {
                 CK(cudaMemcpyAsync(ckp.win[i].data(), kept ? l.snap_win : l.win, ckp.win[i].size(),
                                    cudaMemcpyDeviceToHost, dv.st));
                 if (l.c_kv) {
-                    ckp.comp[2 * i].resize((size_t) l.ratio * g.hd);
-                    ckp.comp[2 * i + 1].resize((size_t) l.ratio * g.hd);
+                    ckp.comp[2 * i].resize(l.c_n());
+                    ckp.comp[2 * i + 1].resize(l.c_n());
                     CK(cudaMemcpyAsync(ckp.comp[2 * i].data(), kept && l.snap_kv ? l.snap_kv : l.c_kv,
                                        ckp.comp[2 * i].size() * 4, cudaMemcpyDeviceToHost, dv.st));
                     CK(cudaMemcpyAsync(ckp.comp[2 * i + 1].data(), kept && l.snap_sc ? l.snap_sc : l.c_score,
@@ -8593,8 +8627,8 @@ struct Model::Impl {
             int nj = 0;
             j[nj++] = job(l.wq_a, d.x, d.qr, T, D, g.q_lora);
             j[nj++] = job(l.wkv, d.x, d.kvr, T, D, HD);
-            if (l.kv_src) j[nj++] = job(l.c_wkv, d.x, d.ckr, T, D, HD);
-            if (l.kv_src && l.ratio > 1) j[nj++] = job(l.c_wgate, d.x, d.cgr, T, D, HD);
+            if (l.kv_src) j[nj++] = job(l.c_wkv, d.x, d.ckr, T, D, l.c_wide);
+            if (l.kv_src && l.ratio > 1) j[nj++] = job(l.c_wgate, d.x, d.cgr, T, D, l.c_wide);
             if (!mv_n(d, j, nj, err)) return false;
         }
         Finish fq;
@@ -8656,13 +8690,14 @@ struct Model::Impl {
                     CK(cudaMemcpyAsync(d.latent, d.ckr, (size_t) T * HD * 4, cudaMemcpyDeviceToDevice, s));
                 } else {
                     if (spec_win && l.c_snap != nullptr) {   // to replay the accepted rows if drafts are rejected
-                        const size_t ns = (size_t) R * HD * 4, nr = (size_t) T * HD * 4;
+                        const size_t ns = l.c_n() * 4, nr = (size_t) T * l.c_wide * 4;
                         CK(cudaMemcpyAsync(l.c_snap, l.c_kv, ns, cudaMemcpyDeviceToDevice, s));
-                        CK(cudaMemcpyAsync(l.c_snap + (size_t) R * HD, l.c_score, ns, cudaMemcpyDeviceToDevice, s));
+                        CK(cudaMemcpyAsync(l.c_snap + l.c_n(), l.c_score, ns, cudaMemcpyDeviceToDevice, s));
                         CK(cudaMemcpyAsync(l.c_rows, d.ckr, nr, cudaMemcpyDeviceToDevice, s));
-                        CK(cudaMemcpyAsync(l.c_rows + (size_t) kWin * HD, d.cgr, nr, cudaMemcpyDeviceToDevice, s));
+                        CK(cudaMemcpyAsync(l.c_rows + (size_t) kWin * l.c_wide, d.cgr, nr, cudaMemcpyDeviceToDevice, s));
                     }
-                    compress_win(d.ckr, d.cgr, l.c_kv, l.c_score, R, (int) p0, T, HD, l.c_norm, g.eps, d.latent, s);
+                    compress_win(d.ckr, d.cgr, l.c_kv, l.c_score, R, l.c_coff, l.c_slots, (int) p0, T, HD, l.c_norm,
+                                 g.eps, l.c_ape, d.latent, s);
                 }
             }
             Rows lim;

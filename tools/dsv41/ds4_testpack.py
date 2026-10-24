@@ -5,15 +5,14 @@
 
     python tools/dsv41/ds4_testpack.py PACK OUT
 
-Two rewrites, both undone by the port and both making the pack numerically wrong:
+One rewrite, undone by the port and making the pack numerically wrong:
 
 1. layers 26 and 42 of unsloth's UD-IQ2_XXS set have MXFP4 down experts and the engine cannot mix MXFP4 with the
    I-quants; their down matrices are pointed at layer 25's / 41's (same shape, wrong values).
-2. a ratio-4 layer's compressor matrices are [2*head, dim] (llama.cpp's coff = 2), the engine's compressor still
-   reads [head, dim]; only the first half is kept.
 
-The output is a copy: the source pack is not changed.  Remove both rewrites when the port in docs/DEEPSEEK4_PORT.md
-is done; a real pack must never be built this way.
+The compressor's shapes are not touched any more: the engine reads deepseek4's two halves a row and the position
+table (docs/DEEPSEEK4_PORT.md, item 1).  The output is a copy: the source pack is not changed.  A real pack must
+never be built this way.
 """
 import pathlib
 import re
@@ -40,7 +39,7 @@ def main() -> int:
         return out
 
     down_25, down_41 = down_of(25), down_of(41)
-    new, n_down, n_cut = [], 0, 0
+    new, n_down = [], 0
     for ln in lines:
         m = re.match(r"(t layers\.(26|42)\.ffn\.experts\.)(\d+)(\.w2\.weight )(.*)", ln)
         if m:
@@ -48,18 +47,9 @@ def main() -> int:
                        (down_25 if m.group(2) == "26" else down_41)[int(m.group(3))])
             n_down += 1
             continue
-        m = re.match(r"t (layers\.\d+\.attn\.compressor\.(?:wkv|wgate))\.weight (\w+) (\d+) (\d+) (\d+) ([0-9 ]+)$", ln)
-        if m:
-            name, dt, fi, off, nb, shape = m.groups()
-            dims = [int(x) for x in shape.split()]
-            if dims[0] == 1024:   # ratio 4: [2*head, dim] -> [head, dim]
-                new.append("t %s.weight %s %s %s %d %s" %
-                           (name, dt, fi, off, int(nb) // 2, " ".join(map(str, [512] + dims[1:]))))
-                n_cut += 1
-                continue
         new.append(ln)
     p.write_text("\n".join(new) + "\n")
-    print("%s: %d down matrices replaced, %d compressor matrices cut (test only)" % (dst, n_down, n_cut))
+    print("%s: %d down matrices replaced (test only)" % (dst, n_down))
     return 0
 
 

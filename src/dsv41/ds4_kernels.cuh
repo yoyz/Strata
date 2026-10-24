@@ -108,11 +108,19 @@ void head_hc_pre(const float* mixes, const float* scale, const float* base, int 
 /// h = silu(min(g, lim)) * clamp(u, -lim, lim)  (lim <= 0: no clamp); n values.
 void swiglu(const float* g, const float* u, int n, float lim, float* h, cudaStream_t s);
 
-/// The ratio-r compressor over a window: token t (position p0 + t) takes slot (p0 + t) % r of the state; each token that
-/// completes a group writes the group's pooled latent (softmax over the slots, per value, then rmsnorm(w)) to the next
-/// row of latent.
-void compress_win(const float* kv, const float* score, float* kv_state, float* score_state, int ratio, int p0, int T,
-                  int d, const float* w, float eps, float* latent, cudaStream_t s);
+/// The ratio-r compressor over a window: token t (position p0 + t) takes slot (p0 + t) % slots of the state; each token
+/// that completes a group writes the group's pooled latent (softmax over the group's rows, per value, then rmsnorm(w)) to
+/// the next row of latent.
+///
+/// A state row is coff * d values, written straight from the projection (kv, score row t at t * coff * d).  coff 1 (V4.1,
+/// and deepseek4's ratio-128 HCA): the row is the group's value, slots = ratio.  coff 2 (deepseek4's ratio-4 CSA, slots
+/// = 2 * ratio): a row's first d values are what the NEXT group reads as its previous half and the last d what its own
+/// group reads, so a group of four tokens mixes the previous four tokens' first halves with its own second halves
+/// (llama.cpp's overlap compressor) - the extra ratio rows keep the previous group until it has been read.  ape, when
+/// given ([ratio][coff * d]), adds the group position's learned row to the score as the row is written.
+void compress_win(const float* kv, const float* score, float* kv_state, float* score_state, int ratio, int coff,
+                  int slots, int p0, int T, int d, const float* w, float eps, const float* ape, float* latent,
+                  cudaStream_t s);
 
 /// Per-query sizes, by value - or (gen > 0, a chunk of any length) made on the device from the query's position: query
 /// t at position p0 + t has nn = (p0 + t + 1) / R compressed positions and cb = min(ccap, ceil(nn / blk)) candidate
