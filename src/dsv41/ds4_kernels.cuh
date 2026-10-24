@@ -111,7 +111,6 @@ void swiglu(const float* g, const float* u, int n, float lim, float* h, cudaStre
 /// The ratio-r compressor over a window: token t (position p0 + t) takes slot (p0 + t) % slots of the state; each token
 /// that completes a group writes the group's pooled latent (softmax over the group's rows, per value, then rmsnorm(w)) to
 /// the next row of latent.
-///
 /// A state row is coff * d values, written straight from the projection (kv, score row t at t * coff * d).  coff 1 (V4.1,
 /// and deepseek4's ratio-128 HCA): the row is the group's value, slots = ratio.  coff 2 (deepseek4's ratio-4 CSA, slots
 /// = 2 * ratio): a row's first d values are what the NEXT group reads as its previous half and the last d what its own
@@ -121,6 +120,12 @@ void swiglu(const float* g, const float* u, int n, float lim, float* h, cudaStre
 void compress_win(const float* kv, const float* score, float* kv_state, float* score_state, int ratio, int coff,
                   int slots, int p0, int T, int d, const float* w, float eps, const float* ape, float* latent,
                   cudaStream_t s);
+
+/// The orthonormal Walsh-Hadamard rotation of each row (len a power of two, at most 1024): the rotation DeepSeek's
+/// lightning indexer puts on its queries and keys before they are rounded to the cache's grid (llama.cpp's k_rot, from
+/// ggml_gen_hadamard).  Orthonormal, so rotating both sides leaves their dot products as they were - it only changes
+/// what the rounding to the index keys' FP4 grid costs.
+void hadamard_rows(float* x, int n_vec, int len, long long stride, cudaStream_t s);
 
 /// Per-query sizes, by value - or (gen > 0, a chunk of any length) made on the device from the query's position: query
 /// t at position p0 + t has nn = (p0 + t + 1) / R compressed positions and cb = min(ccap, ceil(nn / blk)) candidate

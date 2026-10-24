@@ -641,36 +641,39 @@ __global__ void __launch_bounds__(kThreads) index_score_kernel(const float* __re
         return;
     }
     const uint8_t* kr = kc + (size_t) p * kv_row_bytes(KF, HD);
-    float acc[32];
+    float s = 0.0f;
+    for (int h0 = 0; h0 < heads; h0 += 32) {   // 32 heads a pass (deepseek4's indexer has 64)
+        const int hn = min(32, heads - h0);
+        float acc[32];
 #pragma unroll
-    for (int h = 0; h < 32; ++h) acc[h] = 0.0f;
+        for (int h = 0; h < 32; ++h) acc[h] = 0.0f;
 #pragma unroll 2
-    for (int c = 0; c < HD; c += 8) {
-        float kv[8];
-        if (KF == kKvFp4p) {   // 8 codes in 4 bytes, the group's power-of-two scale: the values the finish rounded to
-            const uint32_t cw = *(const uint32_t*) (kr + c / 2);
-            const float ks = ue8m0_val(kr[HD / 2 + c / 32]);
+        for (int c = 0; c < HD; c += 8) {
+            float kv[8];
+            if (KF == kKvFp4p) {   // 8 codes in 4 bytes, the group's power-of-two scale: the values the finish rounded to
+                const uint32_t cw = *(const uint32_t*) (kr + c / 2);
+                const float ks = ue8m0_val(kr[HD / 2 + c / 32]);
 #pragma unroll
-            for (int x = 0; x < 8; ++x) kv[x] = e2m1_val14(cw >> (4 * x)) * 16384.0f * ks;   // (any 2^k: exact)
-        } else {
-            const uint4 raw = *(const uint4*) (kr + c * 2);
-            const uint16_t* b = (const uint16_t*) &raw;
+                for (int x = 0; x < 8; ++x) kv[x] = e2m1_val14(cw >> (4 * x)) * 16384.0f * ks;   // (any 2^k: exact)
+            } else {
+                const uint4 raw = *(const uint4*) (kr + c * 2);
+                const uint16_t* b = (const uint16_t*) &raw;
 #pragma unroll
-            for (int x = 0; x < 8; ++x) kv[x] = bf16f(b[x]);
+                for (int x = 0; x < 8; ++x) kv[x] = bf16f(b[x]);
+            }
+#pragma unroll
+            for (int h = 0; h < 32; ++h) {
+                if (h >= hn) break;
+                const float* qh = qs + (h0 + h) * HD + c;
+#pragma unroll
+                for (int x = 0; x < 8; ++x) acc[h] += qh[x] * kv[x];
+            }
         }
 #pragma unroll
         for (int h = 0; h < 32; ++h) {
-            if (h >= heads) break;
-            const float* qh = qs + h * HD + c;
-#pragma unroll
-            for (int x = 0; x < 8; ++x) acc[h] += qh[x] * kv[x];
+            if (h >= hn) break;
+            s += fmaxf(acc[h], 0.0f) * qs[heads * HD + h0 + h];
         }
-    }
-    float s = 0.0f;
-#pragma unroll
-    for (int h = 0; h < 32; ++h) {
-        if (h >= heads) break;
-        s += fmaxf(acc[h], 0.0f) * qs[heads * HD + h];
     }
     o[i] = s;
 }
@@ -2001,10 +2004,38 @@ void compress_win(const float* kv, const float* score, float* kv_state, float* s
                                       latent);
 }
 
+// the Walsh-Hadamard butterfly in place, one row a block, len / sqrt(len) per row
+__global__ void __launch_bounds__(256) hadamard_kernel(float* x, int len, long long stride) {
+    extern __shared__ float v[];
+    float* r = x + (long long) blockIdx.x * stride;
+    for (int e = threadIdx.x; e < len; e += blockDim.x) v[e] = r[e];
+    __syncthreads();
+    for (int s = 1; s < len; s <<= 1) {
+        for (int e = threadIdx.x; e < len; e += blockDim.x)
+            if ((e & s) == 0) {
+                const float a = v[e], b = v[e + s];
+                v[e] = a + b;
+                v[e + s] = a - b;
+            }
+        __syncthreads();
+    }
+    const float inv = rsqrtf((float) len);
+    for (int e = threadIdx.x; e < len; e += blockDim.x) r[e] = v[e] * inv;
+}
+
+void hadamard_rows(float* x, int n_vec, int len, long long stride, cudaStream_t s) {
+    if (n_vec <= 0 || len <= 0) return;
+    if ((len & (len - 1)) != 0 || len > 1024) {
+        std::fprintf(stderr, "ds4 hadamard_rows: %d values a row is not a power of two up to 1024\n", len);
+        return;
+    }
+    hadamard_kernel<<<n_vec, 128, (size_t) len * sizeof(float), s>>>(x, len, stride);
+}
+
 void index_score(const float* q, const float* w, const void* k, int heads, int hd, int T, int n, const int* cand,
                  int cand_stride, int blk, const Rows& lim, float* out, long long out_stride, cudaStream_t s,
                  int kfmt) {
-    if (hd != 128 || heads > 32 || (kfmt != kKvFp4p && kfmt != kKvBf16)) {
+    if (hd != 128 || heads <= 0 || heads > 128 || (kfmt != kKvFp4p && kfmt != kKvBf16)) {
         std::fprintf(stderr, "ds4 index_score: %d heads of %d (keys %d) not covered\n", heads, hd, kfmt);
         return;
     }

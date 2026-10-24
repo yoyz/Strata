@@ -1,8 +1,9 @@
 # Porting the DeepSeek engine to DeepSeek-V4-Flash-0731 (`deepseek4`)
 
-Status: **experimental, not usable.** The packer accepts the model, the engine loads it, and it decodes — with the
-wrong math, because the indexer (item 2) and the real pack (item 3) are still missing. This note is the restart point:
-what is done, what is left, and how to build and run it.
+Status: **experimental, not usable.** The packer accepts the model, the engine loads it, decodes, and runs the
+model's own sparse attention (the compressor and the indexer) — but a real pack is still missing (item 3), and with it
+any comparison against llama.cpp. This note is the restart point: what is done, what is left, and how to build and
+run it.
 
 ## Where this stands
 
@@ -13,13 +14,15 @@ Branch `f-dsv41-ds4`, worktree `/mnt/nvme_lexar_0/ollama/.local/share/opencode/w
 | `335fcfa1` | the packer accepts `deepseek4`; the engine loads and decodes a pack (test rewrites, below) |
 | `f66aafa4` | the head hyper-connection and the hash layers' routing |
 | `990bb791` | this note and the scripted test pack |
-| `this commit` | the compressor: two halves a row (CSA's overlap), the position table, and the ring that keeps a group across a chunk |
+| `03e7a42a` | the compressor: two halves a row (CSA's overlap), the position table, and the ring that keeps a group across a chunk |
+| `this commit` | the indexer's own compressor (the LID keys), its rotation, and every compressed row on the ratio-128 layers |
 
 Measured 2026-10-24, RX 9070 XT (16 GiB, gfx1201), 125 GiB RAM, one NVMe, the Qwen server stopped, the test pack
 (no expert profile, cold store): dense weights 6.7 s, whole load 12.6 s, 763 of 11,008 experts in VRAM (6.1 GB), the
 rest read in place from the files; a 3-token prompt in 2.24 s, then 2.27 tokens/s decoding, 1.33 GB read from the
-disk a token. Output is still wrong: the indexer below is not written, and the test pack's two substituted layers
-(item 3) put wrong values in two of the 43.
+disk a token. With the indexer in, a 2200-token prompt reads at 199 tokens/s on a cold store (319 warm) and
+decodes at 16-18 tokens/s, with 550 compressed rows and the top-512 selection over them. Output is still wrong: the test pack's two substituted
+layers (item 3) put wrong values in two of the 43.
 
 The compressor is checked against a double reference written from llama.cpp's two compress graphs
 (`tests/dsv41/compress_test.cpp`, 7 runs: CSA with the table, without it, a token a call, several groups a call, V4.1's
@@ -68,7 +71,7 @@ the comparison hooks for the validation step.
 
 ## To do
 
-- [x] **1. The compressor: CSA (ratio 4) and HCA (ratio 128), with the position table.** Done in this commit.
+- [x] **1. The compressor: CSA (ratio 4) and HCA (ratio 128), with the position table.** Done in `03e7a42a`.
   - `src/dsv41/ds4_kernels.cu`: `compress_kernel` / `compress_win` take `coff` and `slots`, write a token's whole
     `coff · head` row (the position table added to the score as the row is written), pool a group over the rows it
     reads - the previous group's first halves and its own second halves (CSA), or its own `ratio` rows (HCA, V4.1) -
@@ -83,16 +86,26 @@ the comparison hooks for the validation step.
   - The doubt about `2·head` rows in `Src`: none needed - the pooled row is `head` wide and the source cache's rows
     are unchanged; only the compressor's own state got wider.
 
-- [ ] **2. The indexer's own compressor (LID), 21 ratio-4 layers.**
-  - Tensors already mapped: `attn.indexer.compressor.{wkv,wgate,ape,norm}` (`[dim, 2·128]`, `[256, 4]`, `[128]`).
-  - It is the CSA algorithm at `index_head_dim` 128: compressed 128-wide keys, then the existing query path
-    (`indexer.wq_b` on the q-lora vector, `indexer.proj` weights, top-512 over the compressed rows).
-  - `src/dsv41/ds4_model.cu` indexer block in `load_dense` and the attention path; `pack_gguf.py` must then write
-    `index_source_layer_ids` = the 21 layers (it leaves it empty today on purpose, so the compressed rows are read
-    without an index selection).
-  - Open question (*static*): llama.cpp multiplies the indexer q/k by a Hadamard matrix (`inp_lid.k_rot`,
-    `llama_mul_mat_hadamard`) when its KV cache is quantised. The engine's cache is its own FP4 format; decide
-    whether the rotation belongs to the model or only to llama.cpp's cache quantisation before copying it.
+- [x] **2. The indexer's own compressor (LID), 21 ratio-4 layers.** Done in this commit.
+  - `Layer::i_comp`, `i_cwkv`/`i_cwgate`, `i_cnorm`/`i_ape`, `i_kv`/`i_score` (the same shape rules as the KV
+    compressor: two halves of 128, a ring of `2·ratio` rows); the keys are its pooled rows, normed and roped with the
+    compressor's own weights, packed to the index cache as before. `indexer.wk` is not read when the pack has this.
+  - `hadamard_rows` (ds4_kernels.cu): the orthonormal Walsh-Hadamard llama.cpp applies to the indexer's queries and
+    keys (`ggml_gen_hadamard`). It is part of the model, not of llama.cpp's cache quantisation: `attn_rot_k` is set
+    for `LLM_ARCH_DEEPSEEK4` unconditionally (`llama-kv-cache.cpp`), and DeepSeek's own indexer computes q/k on a
+    quantised grid. Both sides are rotated, so the scores are unchanged and only the FP4 rounding differs.
+  - `index_score` now takes 64 heads (32 at a time); the old limit of 32 refused the model's indexer.
+  - The ratio-128 layers have no indexer: they attend to every compressed row (llama.cpp's `build_hca_attention`).
+    That needed a path of its own (`i_comp_model`): before, a `ratio > 0` layer with no index source took the count
+    the last indexer left and *its* row ids, which is wrong for a cache of 128-token rows. Capped at the selection
+    buffer (512 rows), which is exact to a 65,536-token context.
+  - `pack_gguf.py` writes `index_source_layer_ids` = the 21 layers that carry the compressor (V4.1's `indexer.attn_k`
+    when a pack has that instead).
+  - The indexer's state is part of the checkpoints, the conversation slots (a pack without it writes the same bytes
+    as before), the mid-run `feed_mark` and the speculative window's replay.
+  - Not checked against llama.cpp: the top-512 selection only starts to matter past 512 compressed rows (about 2,048
+    tokens), and the test pack's two substituted layers are in the way before that. What is measured: a 2200-token
+    prompt runs the selection (550 rows -> 512) without a fault, at 199 tokens/s.
 
 - [ ] **3. MXFP4 mixed with the I-quants (the real pack has it).**
   - Layers 26 and 42 of UD-IQ2_XXS have MXFP4 down experts; `expert_layout_mx` rejects MXFP4 beside IQ gate/up.
@@ -165,13 +178,18 @@ next group reads as its previous half, the last `head` what its own group reads)
 keep the previous group until it has been read. `coff` comes from the pack (`attn.compressor.wkv`'s row count over
 `head`), so a V4.1 pack still runs the old shapes.
 
-### 2. Indexer: it compresses its own keys
+### 2. Indexer: it compresses its own keys — **done**
 
 V4.1: `indexer.wk` projects the main compressed rows into index keys.
 
 V4-Flash: 21 ratio-4 layers carry `indexer_compressor_{ape,kv,gate,norm}` — the same CSA algorithm at 128 wide —
 and those compressed rows are the keys; `indexer.attn_k` does not exist. The candidate-block step
-(`cand_src`/`uses_cand`) does not exist either.
+(`cand_src`/`uses_cand`) does not exist either (the engine's `uses_cand` stays false).
+
+The engine runs the compressor per layer (`Layer::i_comp`), rotates both sides of the indexer's dot products with the
+Walsh-Hadamard the model uses (`hadamard_rows`), and lets the ratio-128 layers see every compressed row, since they
+have no indexer at all (llama.cpp's `build_hca_attention`; its `build_csa_lid_attention` is the ratio-4 path, and
+`attn_rot_k` is always on for this architecture, so the rotation is the model's, not a cache-quantisation detail).
 
 ### 3. The first three layers route by token id — **done**
 
@@ -195,18 +213,18 @@ values, `sigmoid(scale·mix + base) + eps`, weighted sum, then `output_norm` and
 - carries `ffn_gate_tid2eid` as I32 (`layers.N.ffn.gate.tid2eid`) and `hash_layer_count`;
 - writes a header-only `engram.bin` when the model has no Engram (the engine opens it unconditionally);
 - takes the tokenizer `pre` from the GGUF (`joyai-llm`) instead of assuming `deepseek3`;
-- writes `kv_source_layer_ids` for every ratio>0 layer, and leaves `index_source_layer_ids` empty until item 2.
+- writes `kv_source_layer_ids` for every ratio>0 layer and `index_source_layer_ids` for the 21 that carry the
+  indexer's compressor.
 
 ## What the engine does with the pack today
 
 `strata-dsv41` reads `ds4.txt` + `tensors.txt`, places the dense weights and as many experts as VRAM holds, reads
-the rest in place from the GGUF, and runs the V4.1 graph with deepseek4's own compressor: window + the compressed
-rows (a layer's own, from the two halves of its group and the position table) + (no) indexer attention, hyper-
-connections per layer, MoE with top-k or the hash table, and the head with its hyper-connection. The indexer still
-reads the compressed rows without a selection (item 2: with every source visible it attends to all of them, which is
-right for the first 512 rows of a prompt and wrong past that), and the test pack's two substituted layers put wrong
-values in layers 26 and 42. So the output stays wrong until items 2 and 3 land; the compressor itself is checked
-against its double reference (`ds4_compress_test`), not yet against llama.cpp.
+the rest in place from the GGUF, and runs the model's own graph: the window, the compressed rows (each layer its own,
+from the two halves of its group and the position table), the ratio-4 layers' top-512 selection from the indexer's
+own compressed keys, every compressed row on the ratio-128 layers, hyper-connections per layer, MoE with top-k or the
+hash table, and the head with its hyper-connection. What is left is the real pack (item 3: layers 26 and 42 still
+carry the test pack's substituted down experts) and the comparison against llama.cpp (item 4). The compressors are
+checked against a double reference (`ds4_compress_test`); the indexer's selection is not checked yet.
 
 ## Cautions
 

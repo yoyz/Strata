@@ -119,9 +119,9 @@ LAYER = {
     # compressor (it compresses its 128-wide keys itself instead of reading a source layer's)
     "attn_compressor_ape.weight": "attn.compressor.ape",
     "indexer_compressor_ape.weight": "attn.indexer.compressor.ape",
-    "indexer_compressor_kv.weight": "attn.indexer.compressor.wkv",
-    "indexer_compressor_gate.weight": "attn.indexer.compressor.wgate",
-    "indexer_compressor_norm.weight": "attn.indexer.compressor.norm",
+    "indexer_compressor_kv.weight": "attn.indexer.compressor.wkv.weight",
+    "indexer_compressor_gate.weight": "attn.indexer.compressor.wgate.weight",
+    "indexer_compressor_norm.weight": "attn.indexer.compressor.norm.weight",
     "indexer.attn_q_b.weight": "attn.indexer.wq_b.weight",
     "indexer.attn_k.weight": "attn.indexer.wk.weight",
     "indexer.k_norm.weight": "attn.indexer.k_norm.weight",
@@ -504,15 +504,16 @@ def main() -> int:
     have = {t[0] for g in gs for t in g.tensors}
     arch = kv["general.architecture"]
     # deepseek4 (V4-Flash-0731) names no KV / indexer sources: every layer that carries a compressor owns its own
-    # compressed KV (V4.1 shares one source for each ratio).  The indexer's sources stay the layers that still carry
-    # the old indexer.attn_k: V4-Flash's indexer compresses its own keys (indexer_compressor_*) and the engine does not
-    # read them yet, so none is declared and the compressed rows are read without an index selection.
+    # compressed KV (V4.1 shares one source for each ratio), and every ratio-4 layer that carries the indexer's own
+    # compressor owns the index keys it makes from its own compressed rows (indexer_compressor_*, docs/DEEPSEEK4_PORT.md
+    # item 2) - the V4.1 indexer.wk, which projected a source layer's compressed rows, does not exist in this model.
     if arch == "deepseek4":
         cr = list(kv.get(arch + ".attention.compress_ratios", []))
         nl = int(kv.get(arch + ".block_count", 0))
         kv.setdefault(arch + ".attention.kv_source_layers", [il for il, r in enumerate(cr[:nl]) if r > 0])
         kv.setdefault(arch + ".attention.indexer.source_layers",
-                      sorted({int(n.split(".")[1]) for n in have if n.endswith(".indexer.attn_k.weight")}))
+                      sorted({int(n.split(".")[1]) for n in have
+                              if n.endswith(".indexer_compressor_kv.weight") or n.endswith(".indexer.attn_k.weight")}))
     int_tensors_to_engram(gs, kv)
     layers = kv.get("%s.engram.layers" % arch, [])
     # An official IST-DAS set (helcig/tmp-oct26-2) carries the Engram gate/kv as their own k, q, wkv tensors and a 3-D attn_output_a, and the

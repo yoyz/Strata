@@ -472,6 +472,7 @@ struct Dev {
           *freqs_win = nullptr, *freqs_comp = nullptr, *xe = nullptr, *xg = nullptr, *xu = nullptr, *xhh = nullptr,
           *ed = nullptr;
     float* glog_a = nullptr;   // lookahead: the next two layers' gate logits on this layer's FFN input (rows 1024 apart)
+    float *icr = nullptr, *ics = nullptr;   // deepseek4's indexer compressor: a window's rows of 2 * index_head_dim
     int *ridx = nullptr, *topk = nullptr, *cand = nullptr, *tok = nullptr, *tids = nullptr;   // tids: the window's token ids
     unsigned long long* plan_ptr = nullptr;           // the decode path's VRAM experts (0: on the CPU lane)
     uint8_t* eg_rows = nullptr;
@@ -529,6 +530,7 @@ struct Chunk {
           *scores = nullptr, *bm = nullptr, *mix = nullptr, *a_pre = nullptr, *a_post = nullptr, *a_comb = nullptr,
           *f_pre = nullptr, *f_post = nullptr, *f_comb = nullptr, *pre = nullptr, *glog = nullptr, *rw = nullptr,
           *sg = nullptr, *su = nullptr, *y = nullptr, *eg_x = nullptr, *eg_kv = nullptr;
+    float *icr = nullptr, *ics = nullptr;   // deepseek4's indexer compressor: a chunk's rows of 2 * index_head_dim
     uint16_t *x16 = nullptr, *qr16 = nullptr, *o16 = nullptr, *oa16 = nullptr, *lat16 = nullptr, *sh16 = nullptr,
              *h16 = nullptr, *eg_x16 = nullptr, *ext = nullptr, *w16 = nullptr, *emb = nullptr;
     size_t w16_elems = 0;
@@ -653,9 +655,22 @@ struct Layer {
     int c_coff = 1;                             // 2 on deepseek4's ratio-4 layers (CSA: two halves a row)
     int c_slots = 0, c_wide = 0;                // the group's ring: c_slots rows of c_wide floats (c_coff * hd)
     size_t c_n() const { return (size_t) c_slots * (size_t) c_wide; }
+    // deepseek4: the indexer compresses its own keys (indexer_compressor_*) - the same CSA at index_head_dim, its own
+    // table and norm - instead of projecting the layer's compressed rows with indexer.wk (V4.1)
+    bool i_comp = false;
+    x3::Mat i_cwkv, i_cwgate;
+    float *i_cnorm = nullptr, *i_ape = nullptr;
+    float *i_kv = nullptr, *i_score = nullptr;  // the ring: i_slots rows of i_wide floats (2 * index_head_dim)
+    int i_slots = 0, i_wide = 0;
+    size_t i_n() const { return (size_t) i_slots * (size_t) i_wide; }
+    // the compressor states by index: 0 the layer's KV compressor, 1 deepseek4's indexer compressor (null: absent)
+    float* cmp_kv(int k) const { return k == 0 ? c_kv : i_kv; }
+    float* cmp_sc(int k) const { return k == 0 ? c_score : i_score; }
+    size_t cmp_n(int k) const { return k == 0 ? c_n() : i_n(); }
     // a run of chunks' mid-run checkpoint (feed_mark): the ring and the partial group as they were before a row
     uint8_t* snap_win = nullptr;
     float *snap_kv = nullptr, *snap_sc = nullptr;
+    float *snap_ikv = nullptr, *snap_isc = nullptr;   // (the indexer compressor's group too)
     // routed experts
     x3::ExpertLayout lay;
     size_t blob = 0;                            // bytes of one expert's blob
@@ -684,6 +699,7 @@ struct Layer {
     // the window's raw rows (kv, then score) to replay the accepted ones
     uint8_t* ring_bak = nullptr;
     float *c_snap = nullptr, *c_rows = nullptr;
+    float *i_snap = nullptr, *i_rows = nullptr;   // (the indexer compressor's state and rows, the same way)
     unsigned long long* vram_tab = nullptr;     // device [n_exp]
     std::vector<uint8_t> zc;                    // (the RAM store) expert -> 1: its store slot is GPU-visible, the device computes it over PCIe
     unsigned long long* zc_tab = nullptr;       // device [n_exp]: those slots' device addresses (0: none) - the decode token's zc_stage reads it
@@ -2049,6 +2065,25 @@ struct Model::Impl {
             }
             l.c_wide = l.c_coff * g.hd;
             l.c_slots = l.c_coff * l.ratio;
+            l.kv_src = std::find(g.kv_src.begin(), g.kv_src.end(), il) != g.kv_src.end();
+            l.ix_src = std::find(g.ix_src.begin(), g.ix_src.end(), il) != g.ix_src.end();
+            // deepseek4's indexer compresses its own keys: [dim][2 * index_head_dim] projections, ape[4][2 * index_head_dim]
+            if (l.ix_src) {
+                if (const Tensor* tw = pk.get(l.name + "attn.indexer.compressor.wkv.weight");
+                    tw != nullptr && tw->shape.size() == 2 && g.ix_hd > 0) {
+                    const size_t n = (size_t) g.dim == tw->shape[1] ? tw->shape[0] : tw->shape[1];
+                    l.i_comp = true;
+                    i_comp_model = true;
+                    l.i_wide = (int) n;
+                    l.i_slots = l.ratio * (l.i_wide / (int) g.ix_hd);   // deepseek4: two halves a row, 2 * ratio rows
+                    if (l.ratio != 4 || l.i_wide != 2 * g.ix_hd) {
+                        err = l.name + "indexer.compressor: " + std::to_string(l.i_wide) + " values a row on a ratio-" +
+                              std::to_string(l.ratio) + " layer (deepseek4's LID is two halves of " +
+                              std::to_string(g.ix_hd) + ") is not covered";
+                        return false;
+                    }
+                }
+            }
             if (l.mtp) {   // window attention only: no compressor, indexer or Engram
                 if (l.ratio != 0 || l.n_exp <= 0 || l.k_exp <= 0 || l.k_exp > kPicks) {
                     err = l.name + ": a DSpark block of compress ratio " + std::to_string(l.ratio) + ", " +
@@ -2058,8 +2093,6 @@ struct Model::Impl {
                 if (!expert_layout(l, err)) return false;
                 continue;
             }
-            l.kv_src = std::find(g.kv_src.begin(), g.kv_src.end(), il) != g.kv_src.end();
-            l.ix_src = std::find(g.ix_src.begin(), g.ix_src.end(), il) != g.ix_src.end();
             l.owns_k = l.kv_src;
             l.cand_src = il == g.cand_src;
             l.uses_cand = g.cand_src >= 0 && g.cand_src < il && l.ix_src;
@@ -2307,7 +2340,8 @@ struct Model::Impl {
                       dalloc(d, d.tok, 16, err) && dalloc(d, d.tids, W, err) && dalloc(d, d.emb_rows, W * D, err) &&
                       dalloc(d, d.ext, ((size_t) g.win + W) * g.hd, err) && dalloc(d, d.xe, P * D, err) &&
                       dalloc(d, d.xg, P * g.ff, err) && dalloc(d, d.xu, P * g.ff, err) && dalloc(d, d.xhh, P * g.ff, err) &&
-                      dalloc(d, d.ed, P * D, err) && dalloc(d, d.plan_ptr, P, err);
+                      dalloc(d, d.ed, P * D, err) && dalloc(d, d.plan_ptr, P, err) &&
+                      dalloc(d, d.icr, W * 2 * g.ix_hd, err) && dalloc(d, d.ics, W * 2 * g.ix_hd, err);
             if (!ok) return false;
             d.attn_scr.max_t = kAttnScratchT;
             d.attn_scr.cap = (int) topk_stride();
@@ -2885,6 +2919,7 @@ struct Model::Impl {
                       dalloc(d, c.ckr, C * cw, err) && dalloc(d, c.cgr, C * cw, err) &&
                       dalloc(d, c.latent, (C + 2) * HD, err) && dalloc(d, c.lat16, (C + 2) * HD, err) &&
                       dalloc(d, c.ikr, (C + 2) * g.ix_hd, err) && dalloc(d, c.ext, ((size_t) g.win + C) * HD, err) &&
+                      dalloc(d, c.icr, C * 2 * g.ix_hd, err) && dalloc(d, c.ics, C * 2 * g.ix_hd, err) &&
                       dalloc(d, c.q, A * HQ, err) && dalloc(d, c.o, A * HQ, err) && dalloc(d, c.o16, A * HQ, err) &&
                       dalloc(d, c.oa, A * OG * g.o_lora, err) && dalloc(d, c.oa16, A * OG * g.o_lora, err) &&
                       dalloc(d, c.iq, AI * g.ix_heads * g.ix_hd, err) && dalloc(d, c.iw, C * 64, err) &&
@@ -3677,7 +3712,15 @@ struct Model::Impl {
                 const std::string I = A + "indexer.";
                 if (!mat(d, I + "wq_b", l.i_wq_b, err, acct) || !f16raw(d, I + "weights_proj.weight", l.i_wproj, err, acct))
                     return false;
-                if (l.owns_k && (!mat(d, I + "wk", l.i_wk, err, acct) || !f32(d, I + "k_norm.weight", l.ik_norm, err, acct)))
+                if (l.i_comp) {
+                    if (!mat(d, I + "compressor.wkv", l.i_cwkv, err, acct) ||
+                        !mat(d, I + "compressor.wgate", l.i_cwgate, err, acct) ||
+                        !f32(d, I + "compressor.norm.weight", l.i_cnorm, err, acct, (size_t) g.ix_hd) ||
+                        !f32(d, I + "compressor.ape", l.i_ape, err, acct, (size_t) l.ratio * l.i_wide) ||
+                        !dalloc(d, l.i_kv, l.i_n(), err) || !dalloc(d, l.i_score, l.i_n(), err))
+                        return false;
+                } else if (l.owns_k && (!mat(d, I + "wk", l.i_wk, err, acct) ||
+                                        !f32(d, I + "k_norm.weight", l.ik_norm, err, acct)))
                     return false;
             }
             if (l.eg >= 0) {
@@ -3701,6 +3744,9 @@ struct Model::Impl {
                 if (!dalloc(d, l.ring_bak, (size_t) kWin * win_rb(), err)) return false;
                 if (l.kv_src && l.ratio > 1 && (!dalloc(d, l.c_snap, 2 * l.c_n(), err) ||
                                                 !dalloc(d, l.c_rows, (size_t) 2 * kWin * l.c_wide, err)))
+                    return false;
+                if (l.i_comp && (!dalloc(d, l.i_snap, 2 * l.i_n(), err) ||
+                                 !dalloc(d, l.i_rows, (size_t) 2 * kWin * l.i_wide, err)))
                     return false;
             }
             if (!dalloc(d, l.vram_tab, (size_t) l.n_exp, err, acct)) return false;
@@ -4736,6 +4782,8 @@ struct Model::Impl {
                 cudaMemsetAsync(l.win, 0, (size_t) g.win * win_rb(), d.st);
                 if (l.c_kv) cudaMemsetAsync(l.c_kv, 0, l.c_n() * 4, d.st);
                 if (l.c_score) cudaMemsetAsync(l.c_score, 0, l.c_n() * 4, d.st);
+                if (l.i_kv) cudaMemsetAsync(l.i_kv, 0, l.i_n() * 4, d.st);
+                if (l.i_score) cudaMemsetAsync(l.i_score, 0, l.i_n() * 4, d.st);
             }
         for (Dev& d : devs) {
             cudaSetDevice(d.id);
@@ -4749,18 +4797,20 @@ struct Model::Impl {
         Check& c = ck[slot & (kChecks - 1)];
         c.pos = pos;
         c.win.resize(L.size());
-        c.comp.resize(L.size() * 2);
+        c.comp.resize(L.size() * 4);
         for (size_t i = 0; i < L.size(); ++i) {
             Layer& l = L[i];
             Dev& d = devs[(size_t) l.dev];
             cudaSetDevice(d.id);
             c.win[i].resize((size_t) g.win * win_rb());
             cudaMemcpyAsync(c.win[i].data(), l.win, c.win[i].size(), cudaMemcpyDeviceToHost, d.st);
-            if (l.c_kv) {
-                c.comp[2 * i].resize(l.c_n());
-                c.comp[2 * i + 1].resize(l.c_n());
-                cudaMemcpyAsync(c.comp[2 * i].data(), l.c_kv, c.comp[2 * i].size() * 4, cudaMemcpyDeviceToHost, d.st);
-                cudaMemcpyAsync(c.comp[2 * i + 1].data(), l.c_score, c.comp[2 * i + 1].size() * 4,
+            for (int k = 0; k < 2; ++k) {
+                if (l.cmp_kv(k) == nullptr) continue;
+                c.comp[4 * i + 2 * k].resize(l.cmp_n(k));
+                c.comp[4 * i + 2 * k + 1].resize(l.cmp_n(k));
+                cudaMemcpyAsync(c.comp[4 * i + 2 * k].data(), l.cmp_kv(k), c.comp[4 * i + 2 * k].size() * 4,
+                                cudaMemcpyDeviceToHost, d.st);
+                cudaMemcpyAsync(c.comp[4 * i + 2 * k + 1].data(), l.cmp_sc(k), c.comp[4 * i + 2 * k + 1].size() * 4,
                                 cudaMemcpyDeviceToHost, d.st);
             }
         }
@@ -4805,7 +4855,11 @@ struct Model::Impl {
     }
     size_t check_bytes() const {
         size_t n = 16;
-        for (const Layer& l : L) n += (size_t) g.win * win_rb() + (l.c_kv ? 2 * l.c_n() * 4 : 0);
+        for (const Layer& l : L) {
+            n += (size_t) g.win * win_rb();
+            for (int k = 0; k < 2; ++k)
+                if (l.cmp_kv(k) != nullptr) n += 2 * l.cmp_n(k) * 4;
+        }
         return n;
     }
 
@@ -4819,10 +4873,12 @@ struct Model::Impl {
                 Dev& d = devs[(size_t) l.dev];
                 cudaSetDevice(d.id);
                 cudaMemcpyAsync(l.win, c.win[i].data(), c.win[i].size(), cudaMemcpyHostToDevice, d.st);
-                if (l.c_kv) {
-                    cudaMemcpyAsync(l.c_kv, c.comp[2 * i].data(), c.comp[2 * i].size() * 4, cudaMemcpyHostToDevice, d.st);
-                    cudaMemcpyAsync(l.c_score, c.comp[2 * i + 1].data(), c.comp[2 * i + 1].size() * 4,
+                for (int k = 0; k < 2; ++k) {
+                    if (l.cmp_kv(k) == nullptr) continue;
+                    cudaMemcpyAsync(l.cmp_kv(k), c.comp[4 * i + 2 * k].data(), c.comp[4 * i + 2 * k].size() * 4,
                                     cudaMemcpyHostToDevice, d.st);
+                    cudaMemcpyAsync(l.cmp_sc(k), c.comp[4 * i + 2 * k + 1].data(),
+                                    c.comp[4 * i + 2 * k + 1].size() * 4, cudaMemcpyHostToDevice, d.st);
                 }
             }
         for (Dev& d : devs) {
@@ -4850,10 +4906,24 @@ struct Model::Impl {
 
     int64_t src_rows(const Src& s) const { return pos / std::max(1, s.ratio); }
 
+    // whether the pack has deepseek4's indexer compressors (their state is part of a slot, when it does)
+    bool has_lid() const {
+        for (const Layer& l : L)
+            if (l.i_kv != nullptr) return true;
+        return false;
+    }
+    // deepseek4 models: the ratio-128 layers have no indexer and attend to every compressed row (llama.cpp's
+    // build_hca_attention), where V4.1's index sources select their top 512
+    bool i_comp_model = false;
+
     // the slot's bytes: the header, the tokens, every layer's ring and partial group, every source's rows, the end
     size_t slot_bytes() const {
+        const bool lid = has_lid();
         size_t n = 8 + 8 + slot_identity().size() + 8 + (size_t) pos * 4;
-        for (const Layer& l : L) n += 8 + (size_t) g.win * win_rb() + 8 + (l.c_kv ? 2 * l.c_n() * 4 : 0);
+        for (const Layer& l : L) {
+            n += 8 + (size_t) g.win * win_rb() + 8 + (l.c_kv ? 2 * l.c_n() * 4 : 0);
+            if (lid) n += 8 + (l.i_kv ? 2 * l.i_n() * 4 : 0);
+        }
         for (const Src& s : srcs) n += 8 + (size_t) src_rows(s) * (ckv_rb() + ik_rb());
         n += 8 + slot_checks().size() * check_bytes();   // (the checkpoints: what the slot can be taken back at)
         return n + 8;
@@ -4877,6 +4947,7 @@ struct Model::Impl {
             return 0;
         }
         const std::string id = slot_identity();
+        const bool lid = has_lid();
         out.assign(slot_bytes(), 0);
         uint8_t* p = out.data();
         size_t off = 0;
@@ -4905,12 +4976,15 @@ struct Model::Impl {
                 return 0;
             }
             off += (size_t) wb;
-            const uint64_t cn = l.c_kv ? (uint64_t) l.c_n() : 0;
-            put(&cn, 8);
-            if (cn > 0) {
+            for (int k = 0; k < 2; ++k) {
+                if (k == 1 && !lid) break;
+                const float* kv = l.cmp_kv(k);
+                const uint64_t cn = kv != nullptr ? (uint64_t) l.cmp_n(k) : 0;
+                put(&cn, 8);
+                if (cn == 0) continue;
                 const size_t cb = (size_t) cn * 4;
-                if (cudaMemcpy(p + off, l.c_kv, cb, cudaMemcpyDeviceToHost) != cudaSuccess ||
-                    cudaMemcpy(p + off + cb, l.c_score, cb, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                if (cudaMemcpy(p + off, kv, cb, cudaMemcpyDeviceToHost) != cudaSuccess ||
+                    cudaMemcpy(p + off + cb, l.cmp_sc(k), cb, cudaMemcpyDeviceToHost) != cudaSuccess) {
                     err = l.name + "compressor's group: " + cudaGetErrorString(cudaGetLastError());
                     return 0;
                 }
@@ -4948,9 +5022,10 @@ struct Model::Impl {
                 put(&cp, 8);
                 for (size_t i = 0; i < L.size(); ++i) {
                     put(c.win[i].data(), (size_t) g.win * win_rb());
-                    if (L[i].c_kv) {
-                        put(c.comp[2 * i].data(), L[i].c_n() * 4);
-                        put(c.comp[2 * i + 1].data(), L[i].c_n() * 4);
+                    for (int k = 0; k < (lid ? 2 : 1); ++k) {
+                        if (L[i].cmp_kv(k) == nullptr) continue;
+                        put(c.comp[4 * i + 2 * k].data(), L[i].cmp_n(k) * 4);
+                        put(c.comp[4 * i + 2 * k + 1].data(), L[i].cmp_n(k) * 4);
                     }
                 }
             }
@@ -4978,6 +5053,7 @@ struct Model::Impl {
             }
         } guard{*this, wrote, ok};
         const auto room = [&](size_t b) { return b <= bytes && off <= bytes - b; };
+        const bool lid = has_lid();
         uint64_t magic = 0, il = 0, n = 0;
         if (!room(16)) {
             err = "the slot is cut short";
@@ -5040,13 +5116,18 @@ struct Model::Impl {
                 }
             }
             off += (size_t) wb;
-            std::memcpy(&cn, data + off, 8);
-            off += 8;
-            if (cn != (l.c_kv ? (uint64_t) l.c_n() : 0)) {
-                err = l.name + "compressor's group of another size";
-                return false;
-            }
-            if (cn > 0) {
+            for (int k = 0; k < (lid ? 2 : 1); ++k) {
+                if (!room(8)) {
+                    err = "the slot is cut short";
+                    return false;
+                }
+                std::memcpy(&cn, data + off, 8);
+                off += 8;
+                if (cn != (l.cmp_kv(k) != nullptr ? (uint64_t) l.cmp_n(k) : 0)) {
+                    err = l.name + "compressor's group of another size";
+                    return false;
+                }
+                if (cn == 0) continue;
                 const size_t cb = (size_t) cn * 4;
                 if (!room(2 * cb)) {
                     err = "the slot is cut short";
@@ -5054,8 +5135,8 @@ struct Model::Impl {
                 }
                 for (int m = 0; m < l.nm; ++m) {
                     Layer& lm = member(l, m);
-                    if (cudaMemcpy(lm.c_kv, data + off, cb, cudaMemcpyHostToDevice) != cudaSuccess ||
-                        cudaMemcpy(lm.c_score, data + off + cb, cb, cudaMemcpyHostToDevice) != cudaSuccess) {
+                    if (cudaMemcpy(lm.cmp_kv(k), data + off, cb, cudaMemcpyHostToDevice) != cudaSuccess ||
+                        cudaMemcpy(lm.cmp_sc(k), data + off + cb, cb, cudaMemcpyHostToDevice) != cudaSuccess) {
                         err = l.name + "compressor's group: " + cudaGetErrorString(cudaGetLastError());
                         return false;
                     }
@@ -5125,7 +5206,7 @@ struct Model::Impl {
                 Check& c = got[role];
                 c.pos = (int64_t) cp;
                 c.win.resize(L.size());
-                c.comp.resize(L.size() * 2);
+                c.comp.resize(L.size() * 4);
                 for (size_t i = 0; i < L.size(); ++i) {
                     const size_t wb = (size_t) g.win * win_rb(), cb = L[i].c_kv ? L[i].c_n() * 4 : 0;
                     if (!room(wb + 2 * cb)) {
@@ -5135,11 +5216,23 @@ struct Model::Impl {
                     c.win[i].assign(data + off, data + off + wb);
                     off += wb;
                     if (cb > 0) {
-                        c.comp[2 * i].resize(cb / 4);
-                        c.comp[2 * i + 1].resize(cb / 4);
-                        std::memcpy(c.comp[2 * i].data(), data + off, cb);
-                        std::memcpy(c.comp[2 * i + 1].data(), data + off + cb, cb);
+                        c.comp[4 * i].resize(cb / 4);
+                        c.comp[4 * i + 1].resize(cb / 4);
+                        std::memcpy(c.comp[4 * i].data(), data + off, cb);
+                        std::memcpy(c.comp[4 * i + 1].data(), data + off + cb, cb);
                         off += 2 * cb;
+                    }
+                    const size_t ib = L[i].i_kv ? L[i].i_n() * 4 : 0;
+                    if (!room(2 * ib)) {
+                        err = "the slot is cut short";
+                        return false;
+                    }
+                    if (ib > 0) {
+                        c.comp[4 * i + 2].resize(ib / 4);
+                        c.comp[4 * i + 3].resize(ib / 4);
+                        std::memcpy(c.comp[4 * i + 2].data(), data + off, ib);
+                        std::memcpy(c.comp[4 * i + 3].data(), data + off + ib, ib);
+                        off += 2 * ib;
                     }
                 }
             }
@@ -6793,6 +6886,14 @@ struct Model::Impl {
                     compress_win(l.c_rows, l.c_rows + (size_t) kWin * l.c_wide, l.c_kv, l.c_score, l.ratio, l.c_coff,
                                  l.c_slots, (int) p0, keep, g.hd, l.c_norm, g.eps, l.c_ape, d.latent, d.st);
                 }
+                if (l.i_snap != nullptr) {   // (deepseek4's indexer compressor, the same way)
+                    cudaSetDevice(d.id);
+                    const size_t ns = l.i_n() * 4;
+                    cudaMemcpyAsync(l.i_kv, l.i_snap, ns, cudaMemcpyDeviceToDevice, d.st);
+                    cudaMemcpyAsync(l.i_score, l.i_snap + l.i_n(), ns, cudaMemcpyDeviceToDevice, d.st);
+                    compress_win(l.i_rows, l.i_rows + (size_t) kWin * l.i_wide, l.i_kv, l.i_score, l.ratio, 2, l.i_slots,
+                                 (int) p0, keep, g.ix_hd, l.i_cnorm, g.eps, l.i_ape, d.ikr, d.st);
+                }
             }
         pos = p0 + keep;
         toks.resize((size_t) pos);
@@ -6914,19 +7015,52 @@ struct Model::Impl {
             if (l.ix_src) {
                 Src& ks = srcs[(size_t) l.ik_src];
                 if (l.owns_k && ng > 0) {
-                    x3::rows_f16(latent, HD, nullptr, ng, HD, c.lat16, s);
-                    if (!gemm(d, c, l.i_wk, c.lat16, HD, ng, c.ikr, g.ix_hd, 0.0f, err)) return false;
                     Finish fi;
-                    fi.w = l.ik_norm;
                     fi.eps = g.eps;
                     fi.rd = g.rd;
                     fi.pos = (int) (g_first * R);
                     fi.pos_step = R;
                     fi.freqs = freqs;
-                    fi.quant = 3;
-                    fi.pdst = ks.ik[(size_t) l.dev] + (size_t) g_first * ik_rb();
-                    fi.pdst_stride = (long long) ik_rb();
-                    finish(c.ikr, ng, g.ix_hd, g.ix_hd, fi, s);
+                    if (l.i_comp) {   // deepseek4: the keys are the indexer's own compressed rows (128-wide)
+                        if (!gemm(d, c, l.i_cwkv, c.x16, D, T, c.icr, l.i_wide, 0.0f, err) ||
+                            !gemm(d, c, l.i_cwgate, c.x16, D, T, c.ics, l.i_wide, 0.0f, err))
+                            return false;
+                        if (snap && L0.snap_ikv != nullptr) {   // each slot: its latest row before snap_t (as the KV's)
+                            const int64_t ps = p0 + wp.snap_t;
+                            for (int i = 0; i < l.i_slots; ++i) {
+                                const int64_t q = ps - 1 - i;
+                                const int sl = (int) (((q % l.i_slots) + l.i_slots) % l.i_slots);
+                                const float* kv = q >= p0 ? c.icr + (size_t) (q - p0) * l.i_wide
+                                                          : l.i_kv + (size_t) sl * l.i_wide;
+                                const float* sc = q >= p0 ? c.ics + (size_t) (q - p0) * l.i_wide
+                                                          : l.i_score + (size_t) sl * l.i_wide;
+                                CK(cudaMemcpyAsync(L0.snap_ikv + (size_t) sl * l.i_wide, kv, (size_t) l.i_wide * 4,
+                                                   cudaMemcpyDeviceToDevice, s));
+                                CK(cudaMemcpyAsync(L0.snap_isc + (size_t) sl * l.i_wide, sc, (size_t) l.i_wide * 4,
+                                                   cudaMemcpyDeviceToDevice, s));
+                            }
+                        }
+                        compress_win(c.icr, c.ics, l.i_kv, l.i_score, R, 2, l.i_slots, (int) p0, T, g.ix_hd,
+                                     l.i_cnorm, g.eps, l.i_ape, c.ikr, s);
+                    } else {
+                        x3::rows_f16(latent, HD, nullptr, ng, HD, c.lat16, s);
+                        if (!gemm(d, c, l.i_wk, c.lat16, HD, ng, c.ikr, g.ix_hd, 0.0f, err)) return false;
+                    }
+                    fi.w = l.i_comp ? l.i_cnorm : l.ik_norm;
+                    if (l.i_comp) {   // norm + rope, the indexer's rotation, then the rounding and the packing
+                        finish(c.ikr, ng, g.ix_hd, g.ix_hd, fi, s);
+                        hadamard_rows(c.ikr, ng, g.ix_hd, g.ix_hd, s);
+                        Finish fp;
+                        fp.quant = 3;
+                        fp.pdst = ks.ik[(size_t) l.dev] + (size_t) g_first * ik_rb();
+                        fp.pdst_stride = (long long) ik_rb();
+                        finish(c.ikr, ng, g.ix_hd, g.ix_hd, fp, s);
+                    } else {
+                        fi.quant = 3;
+                        fi.pdst = ks.ik[(size_t) l.dev] + (size_t) g_first * ik_rb();
+                        fi.pdst_stride = (long long) ik_rb();
+                        finish(c.ikr, ng, g.ix_hd, g.ix_hd, fi, s);
+                    }
                 }
                 if (clen_max > 0 && !kv_only) {
                     if (!gemm_f16w(c, l.i_wproj, g.ix_heads, D, c.x16, D, T,
@@ -6943,8 +7077,14 @@ struct Model::Impl {
                         fi.pos = (int) pa;
                         fi.vpp = g.ix_heads;
                         fi.freqs = freqs;
-                        fi.quant = 3;
+                        fi.quant = l.i_comp ? 0 : 3;
                         finish(c.iq, na * g.ix_heads, g.ix_hd, g.ix_hd, fi, s);
+                        if (l.i_comp) {   // (the indexer's rotation, then the rounding to the keys' grid)
+                            hadamard_rows(c.iq, na * g.ix_heads, g.ix_hd, g.ix_hd, s);
+                            Finish fr2;
+                            fr2.quant = 3;
+                            finish(c.iq, na * g.ix_heads, g.ix_hd, g.ix_hd, fr2, s);
+                        }
                         Rows lim;
                         lim.gen = 1;
                         lim.p0 = pa;
@@ -7029,7 +7169,10 @@ struct Model::Impl {
             ar.t0 = a0;
             ar.win = g.win;
             ar.R = l.ratio;
-            ar.kcap = g.ix_topk;
+            // (deepseek4's HCA layers have no indexer: every compressed row, the ids their own index)
+            const bool all_rows = l.ratio > 0 && !l.ix_src && i_comp_model;
+            ar.kcap = all_rows ? (int) topk_stride() : g.ix_topk;
+            if (all_rows && a0 == 0) iota_rows(c.topk, T, ar.kcap, (int) topk_stride(), s);
             sparse_attn(c.q, c.ext, ckv, c.topk + (size_t) a0 * topk_stride(), (int) topk_stride(), ar, l.sink, NHL, HD,
                         na, 1.0f / std::sqrt((float) HD), c.o, s, kKvFp4, 0, &d.attn_scr);   // (a short last slab)
             prof_mark(d, 9);
@@ -8014,6 +8157,9 @@ struct Model::Impl {
                 if (l.c_kv != nullptr && l.snap_kv == nullptr &&
                     (!dalloc(d, l.snap_kv, l.c_n(), err) || !dalloc(d, l.snap_sc, l.c_n(), err)))
                     return false;
+                if (l.i_kv != nullptr && l.snap_ikv == nullptr &&
+                    (!dalloc(d, l.snap_ikv, l.i_n(), err) || !dalloc(d, l.snap_isc, l.i_n(), err)))
+                    return false;
             }
         }
         const int T_last = run.T.back();
@@ -8200,7 +8346,7 @@ struct Model::Impl {
             Check& ckp = ck[snap_slot & 1];
             ckp.pos = run.snap_pos;
             ckp.win.resize(L.size());
-            ckp.comp.resize(L.size() * 2);
+            ckp.comp.resize(L.size() * 4);
             for (size_t i = 0; i < L.size(); ++i) {
                 Layer& l = L[i];
                 Dev& dv = devs[(size_t) l.dev];
@@ -8210,12 +8356,20 @@ struct Model::Impl {
                 CK(cudaMemcpyAsync(ckp.win[i].data(), kept ? l.snap_win : l.win, ckp.win[i].size(),
                                    cudaMemcpyDeviceToHost, dv.st));
                 if (l.c_kv) {
-                    ckp.comp[2 * i].resize(l.c_n());
-                    ckp.comp[2 * i + 1].resize(l.c_n());
-                    CK(cudaMemcpyAsync(ckp.comp[2 * i].data(), kept && l.snap_kv ? l.snap_kv : l.c_kv,
-                                       ckp.comp[2 * i].size() * 4, cudaMemcpyDeviceToHost, dv.st));
-                    CK(cudaMemcpyAsync(ckp.comp[2 * i + 1].data(), kept && l.snap_sc ? l.snap_sc : l.c_score,
-                                       ckp.comp[2 * i + 1].size() * 4, cudaMemcpyDeviceToHost, dv.st));
+                    ckp.comp[4 * i].resize(l.c_n());
+                    ckp.comp[4 * i + 1].resize(l.c_n());
+                    CK(cudaMemcpyAsync(ckp.comp[4 * i].data(), kept && l.snap_kv ? l.snap_kv : l.c_kv,
+                                       ckp.comp[4 * i].size() * 4, cudaMemcpyDeviceToHost, dv.st));
+                    CK(cudaMemcpyAsync(ckp.comp[4 * i + 1].data(), kept && l.snap_sc ? l.snap_sc : l.c_score,
+                                       ckp.comp[4 * i + 1].size() * 4, cudaMemcpyDeviceToHost, dv.st));
+                }
+                if (l.i_kv) {   // (deepseek4's indexer compressor: the same, its own group)
+                    ckp.comp[4 * i + 2].resize(l.i_n());
+                    ckp.comp[4 * i + 3].resize(l.i_n());
+                    CK(cudaMemcpyAsync(ckp.comp[4 * i + 2].data(), kept && l.snap_ikv ? l.snap_ikv : l.i_kv,
+                                       ckp.comp[4 * i + 2].size() * 4, cudaMemcpyDeviceToHost, dv.st));
+                    CK(cudaMemcpyAsync(ckp.comp[4 * i + 3].data(), kept && l.snap_isc ? l.snap_isc : l.i_score,
+                                       ckp.comp[4 * i + 3].size() * 4, cudaMemcpyDeviceToHost, dv.st));
                 }
             }
             for (Dev& dv : devs) {
@@ -8250,6 +8404,8 @@ struct Model::Impl {
                     for (int t = 0; t < T; ++t) cur_topk_n[t] = k[t];
                 }
                 for (int t = 0; t < T; ++t) wp.topk[il][t] = cur_topk_n[t];
+                if (!l.ix_src && i_comp_model)   // deepseek4's HCA layers have no indexer: every compressed row
+                    for (int t = 0; t < T; ++t) wp.topk[il][t] = std::min(n[t], (int) topk_stride());
             }
             if (wp.async) {
                 wp.seq[il] = ++seq_issued;
@@ -8710,19 +8866,48 @@ struct Model::Impl {
             if (l.ix_src) {
                 Src& ks = srcs[(size_t) l.ik_src];
                 if (l.owns_k && ng > 0) {
-                    if (!mv(d, {job(l.i_wk, d.latent, d.ikr, ng, HD, g.ix_hd)}, err)) return false;
                     Finish fi;
-                    fi.w = l.ik_norm;
                     fi.eps = g.eps;
                     fi.rd = g.rd;
                     fi.pos = (int) (g_first * R);
                     fi.pos_step = R;
                     fi.freqs = freqs;
-                    fi.quant = 3;
-                    fi.pdst = ks.ik[(size_t) l.dev] + (size_t) g_first * ik_rb();
-                    fi.pdst_stride = (long long) ik_rb();
-                    finish(d.ikr, ng, g.ix_hd, g.ix_hd, fi, s);
-                    if (!wp.par && !replicate(ks.ik, ks.h_ik, ks.ev_ik, fi.pdst, (size_t) g_first * ik_rb(),
+                    if (l.i_comp) {   // deepseek4: the keys are the indexer's own compressed rows (128-wide)
+                        if (spec_win && l.i_snap != nullptr) {   // the ring before this window (the rows follow below)
+                            const size_t ns = l.i_n() * 4;
+                            CK(cudaMemcpyAsync(l.i_snap, l.i_kv, ns, cudaMemcpyDeviceToDevice, s));
+                            CK(cudaMemcpyAsync(l.i_snap + l.i_n(), l.i_score, ns, cudaMemcpyDeviceToDevice, s));
+                        }
+                        if (!mv(d, {job(l.i_cwkv, d.x, d.icr, T, D, l.i_wide),
+                                    job(l.i_cwgate, d.x, d.ics, T, D, l.i_wide)}, err))
+                            return false;
+                        if (spec_win && l.i_snap != nullptr) {   // its rows, to replay the accepted ones
+                            const size_t nr = (size_t) T * l.i_wide * 4;
+                            CK(cudaMemcpyAsync(l.i_rows, d.icr, nr, cudaMemcpyDeviceToDevice, s));
+                            CK(cudaMemcpyAsync(l.i_rows + (size_t) kWin * l.i_wide, d.ics, nr, cudaMemcpyDeviceToDevice, s));
+                        }
+                        compress_win(d.icr, d.ics, l.i_kv, l.i_score, R, 2, l.i_slots, (int) p0, T, g.ix_hd,
+                                     l.i_cnorm, g.eps, l.i_ape, d.ikr, s);
+                    } else if (!mv(d, {job(l.i_wk, d.latent, d.ikr, ng, HD, g.ix_hd)}, err)) {
+                        return false;
+                    }
+                    fi.w = l.i_comp ? l.i_cnorm : l.ik_norm;
+                    uint8_t* kdst = ks.ik[(size_t) l.dev] + (size_t) g_first * ik_rb();
+                    if (l.i_comp) {   // norm + rope, the indexer's rotation, then the rounding and the packing
+                        finish(d.ikr, ng, g.ix_hd, g.ix_hd, fi, s);
+                        hadamard_rows(d.ikr, ng, g.ix_hd, g.ix_hd, s);
+                        Finish fp;
+                        fp.quant = 3;
+                        fp.pdst = kdst;
+                        fp.pdst_stride = (long long) ik_rb();
+                        finish(d.ikr, ng, g.ix_hd, g.ix_hd, fp, s);
+                    } else {
+                        fi.quant = 3;
+                        fi.pdst = kdst;
+                        fi.pdst_stride = (long long) ik_rb();
+                        finish(d.ikr, ng, g.ix_hd, g.ix_hd, fi, s);
+                    }
+                    if (!wp.par && !replicate(ks.ik, ks.h_ik, ks.ev_ik, kdst, (size_t) g_first * ik_rb(),
                                               (size_t) ng * ik_rb(), l.dev, err))
                         return false;
                 }
@@ -8733,14 +8918,20 @@ struct Model::Impl {
                     fi.pos = (int) p0;
                     fi.vpp = g.ix_heads;
                     fi.freqs = freqs;
-                    fi.quant = 3;
+                    fi.quant = l.i_comp ? 0 : 3;
                     finish(d.iq, T * g.ix_heads, g.ix_hd, g.ix_hd, fi, s);
+                    if (l.i_comp) {   // (the indexer's rotation, then the rounding to the keys' grid)
+                        hadamard_rows(d.iq, T * g.ix_heads, g.ix_hd, g.ix_hd, s);
+                        Finish fr2;
+                        fr2.quant = 3;
+                        finish(d.iq, T * g.ix_heads, g.ix_hd, g.ix_hd, fr2, s);
+                    }
                     // (iw rows are 64 apart)
                     gemv_f16_rows(l.i_wproj, d.x, (size_t) D, g.ix_heads, D, T,
                                   1.0f / std::sqrt((float) g.ix_hd) / std::sqrt((float) g.ix_heads), d.iw, 64, s);
                     const long long ss = (long long) o.max_context + 64;
                     bool restrict_ = false;
-                    for (int t = 0; t < T; ++t)
+                    for (int t = 0; t < T && l.uses_cand; ++t)   // (a pack without the candidate step: no block size)
                         restrict_ = restrict_ || (lim.n[t] + g.cand_blk - 1) / g.cand_blk > g.cand_topk;
                     if (l.uses_cand && restrict_) {
                         Rows cl;   // the candidate positions of each query: its blocks x blk
@@ -8803,6 +8994,8 @@ struct Model::Impl {
                 }
             }
             for (int t = 0; t < T; ++t) ar.nsel[t] = lim.n[t] > 0 ? wp.topk[l.il][t] : 0;
+            if (l.ratio > 0 && !l.ix_src && i_comp_model)   // (deepseek4's HCA layers: every row, its own index)
+                iota_rows(d.topk, T, std::min<int64_t>((int) topk_stride(), o.max_context / l.ratio + 1), (int) topk_stride(), s);
             ckv = sr.ckv[(size_t) l.dev];
         }
         if (l.mtp) {   // the block's rows (BF16), after the ring's in ext, as every query's selection
