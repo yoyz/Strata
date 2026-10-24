@@ -23,11 +23,14 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 import setup  # noqa: E402
 from strata_control import dsv41_fit  # noqa: E402
+from strata_control import dsv41_engine as dsv41_engine_mod  # noqa: E402
 
 SHA = re.compile(r"/resolve/[0-9a-f]{40}/")
 REPO = "unsloth/DeepSeek-V4.1-Flash-1017-GGUF"
+REPO4 = "unsloth/DeepSeek-V4-Flash-0731-GGUF"
 R9700 = {"name": "AMD Radeon AI PRO R9700", "vram_gb": 32.0, "vendor": "amd"}
 FOUR = [{**R9700, "index": i} for i in range(4)]
+X9070 = {"name": "AMD Radeon RX 9070 XT", "vram_gb": 16.0, "vendor": "amd", "index": 0}
 
 
 def args(**kw):
@@ -67,6 +70,34 @@ class Entries(unittest.TestCase):
         self.assertNotIn("deepseek41", setup.FAMILIES)
         self.assertNotIn("deepseek41", setup.OWN_PATH_FAMILIES)
         self.assertNotIn("UD-Q8_K_XL", setup.MODELS)
+
+    def test_deepseek4_pinned_and_hashed(self):
+        fam = setup.MULTI_FILE_FAMILIES["deepseek4"]
+        rev = "fbbb5b93fb787c21338159b0af3318bb3f4d9768"
+        self.assertEqual(setup.HF_REVISIONS[REPO4], rev)
+        self.assertRegex(fam["hf"], SHA)
+        self.assertTrue(fam["hf"].endswith(f"{REPO4}/resolve/{rev}/UD-IQ2_XXS/"))
+        self.assertIs(setup.REPO_PINS[REPO4], setup.DS4_FILES)
+        self.assertEqual((fam["arch"], fam["tag"], fam["name"]), ("deepseek4", "deepseek-v4-flash-0731-", "deepseek-v4-flash-0731"))
+        self.assertFalse(fam["vision"])
+        self.assertEqual(list(fam["models"]), ["UD-IQ2_XXS"])
+        md = fam["models"]["UD-IQ2_XXS"]
+        self.assertEqual(len(md["shards"]), 3)
+        self.assertEqual(md["shared"], [])                      # no Engram table, no drafter fetched
+        self.assertEqual(sum(setup.DS4_FILES[n][0] for n in md["shards"]), 90_860_736_928)
+        self.assertEqual((md["recipe"], md["subdir"], md["dense_gb"]), ("ds4", "UD-IQ2_XXS", 7.0))
+        for n, (size, sha) in setup.DS4_FILES.items():
+            self.assertRegex(sha, r"^[0-9a-f]{64}$", n)
+            self.assertGreater(size, 5e6)
+        self.assertEqual(setup.DS4_DSPARK, "dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf")   # pinned for later, not in the shards
+        self.assertNotIn("UD-IQ2_XXS", setup.MODELS)
+
+    def test_deepseek4_config_read_back(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "strata-deepseek-v4-flash-0731-ud-iq2_xxs.json"
+            p.write_text(json.dumps({"args": ["--pack", "x", "--max-context", "8192", "--dspark", "none"], "port": 8080}))
+            ch = setup.choices_from_config(p)
+            self.assertEqual((ch["family"], ch["model"], ch["context"]), ("deepseek4", "UD-IQ2_XXS", 8192))
 
     def test_config_read_back(self):
         with tempfile.TemporaryDirectory() as d:
@@ -127,6 +158,35 @@ class Fit(unittest.TestCase):
         self.assertEqual(p["verdict"], "no_card")
         self.assertTrue(any("No graphics card" in w for w in p["warnings"]))
 
+    def test_the_numbers_of_deepseek4(self):
+        # the engine's own --pack-info on UD-IQ2_XXS (2026-10-25): 11008 experts of 7,619,000 bytes, dense 6.99 GB, no Engram
+        self.assertEqual((dsv41_fit.DS4_LAYERS, dsv41_fit.DS4_EXPERTS_PER_LAYER, dsv41_fit.DS4_EXPERTS), (43, 256, 11008))
+        self.assertAlmostEqual(dsv41_fit.DS4_WEIGHTS_GB, 90.86, delta=0.01)
+        self.assertAlmostEqual(dsv41_fit.DS4_EXPERTS_GB, 83.87, delta=0.01)
+        self.assertAlmostEqual(dsv41_fit.DS4_DENSE_GB, 6.99, delta=0.01)
+        self.assertAlmostEqual(dsv41_fit.DS4_EXPERT_GB * 1000, 7.62, delta=0.01)
+
+    def test_deepseek4_on_this_box(self):
+        # measured 2026-10-25: 701 of 11008 experts in a 16 GB RX 9070 XT, 125 GB of RAM, 11.8 tokens a second
+        p = dsv41_fit.plan([X9070], 125.0, 1400.0, context=8192, family="deepseek4")
+        self.assertEqual(p["verdict"], "fits")
+        self.assertEqual((p["experts_total"], p["tp"], p["args"]), (11008, 1, []))
+        self.assertEqual(p["engram_gb"], 0.0)
+        self.assertLess(abs(p["experts_in_vram"] - 701), 80)                  # the plan's placement against the measured one
+        self.assertAlmostEqual(p["vram_experts_gb"], p["experts_in_vram"] * dsv41_fit.DS4_EXPERT_GB, delta=0.1)
+        self.assertTrue(any("no n-gram table" in l for l in p["lines"]))
+        self.assertIn("11.8 tokens a second", " ".join(p["lines"]))
+        self.assertTrue(p["disk_ok"])
+        # the model's name alone picks the same plan (strata_cli/catalog pass no family)
+        self.assertEqual(dsv41_fit.plan([X9070], 125.0, model="UD-IQ2_XXS")["experts_in_vram"], p["experts_in_vram"])
+
+    def test_deepseek4_with_little_ram_is_a_warning(self):
+        p = dsv41_fit.plan([X9070], 32.0, 50.0, family="deepseek4")
+        self.assertEqual(p["verdict"], "spills")
+        self.assertGreater(p["spill_gb"], 40)
+        self.assertTrue(any("still allowed" in w for w in p["warnings"]))
+        self.assertFalse(p["disk_ok"])
+
     def test_cards_of_two_sizes_share_the_layers_in_proportion(self):
         cards = [{**R9700, "index": 0}, {"name": "RTX A4000", "vram_gb": 16.0, "index": 1}]
         p = dsv41_fit.plan(cards, 256.0)
@@ -181,21 +241,24 @@ class Install(unittest.TestCase):
                    mock.patch.object(setup, "write_setup_config", write_cfg),
                    mock.patch.object(setup, "write_run_script", lambda tag, p, port, o=True: self.root / f"run-{tag}.sh"),
                    mock.patch.object(setup, "ROOT", self.root),
-                   mock.patch.object(setup, "home", lambda: self.root)]
+                   mock.patch.object(setup, "home", lambda: self.root),
+                   # the feed fetch never runs in a test: it would call updater.detect_hardware(), which probes the machine's
+                   # cards (a stale /dev/nvidiactl on a box without the nvidia module makes the kernel spawn modprobe in a loop)
+                   mock.patch.object(dsv41_engine_mod, "install", lambda *a, **k: None)]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
         mock.patch.dict("os.environ", {"STRATA_DSV41_EXE": ""}).start()
         self.addCleanup(mock.patch.stopall)
 
-    def install(self, ram=251.0, cards=None, engine=True, **kw):
+    def install(self, ram=251.0, cards=None, engine=True, family="deepseek41", **kw):
         if engine:
             self.exe.parent.mkdir(parents=True, exist_ok=True)
             self.exe.write_text("x")
         cards = cards or FOUR
-        kw.setdefault("model", "UD-Q8_K_XL")
+        kw.setdefault("model", "UD-Q8_K_XL" if family == "deepseek41" else "UD-IQ2_XXS")
         gpu = {"index": 0, "count": len(cards), "vram_gb": 32.0, "name": "R9700", "cards": cards}
-        return run(setup.install_dsv41, args(models_dir=str(self.root / "models"), **kw), "deepseek41", gpu, True, [], 13, [], 8080, ram,
+        return run(setup.install_dsv41, args(models_dir=str(self.root / "models"), **kw), family, gpu, True, [], 13, [], 8080, ram,
                    None, cards)
 
     def test_installs_the_nine_pinned_shards_and_writes_the_config(self):
@@ -226,6 +289,8 @@ class Install(unittest.TestCase):
         self.assertIn("n-gram table", out)
 
     def test_no_engine_stops_before_the_download(self):
+        # no engine on this computer AND none the feed can supply (strata_control.dsv41_engine.install is mocked in setUp:
+        # the real fetch downloads 346 MiB from GitHub and probes the cards)
         rc, out = self.install(engine=False)
         self.assertEqual(rc, 1, out)
         self.assertIn("DeepSeek's engine is not available for this computer yet", out)
@@ -693,6 +758,71 @@ class InstallSmallest(InstallOfficial):
         self.assertIn("239 GB", out)
         a = self.cfg["args"]
         self.assertEqual(a[a.index("--dspark") + 1], "auto")
+
+
+class InstallDeepseek4(Install):
+    """install_dsv41 for DeepSeek-V4-Flash-0731: three shards, no Engram, no drafter, --dspark none; engine and tools mocked."""
+
+    def install4(self, ram=125.0, model="UD-IQ2_XXS", **kw):
+        patches = [mock.patch.object(setup, "dsv41_pack_info", lambda exe, pack, libs: (True, "files: 3, all present and long enough")),
+                   mock.patch.object(setup, "dsv41_smoke", lambda *a, **k: (True, "The capital of France is Paris."))]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        return self.install(ram=ram, cards=[X9070], family="deepseek4", model=model, **kw)
+
+    def test_the_three_shards_the_plain_pack_and_the_run_settings(self):
+        rc, out = self.install4()
+        self.assertEqual(rc, 0, out)
+        get = [c for c in self.calls if c[0] == "get"]
+        folder = self.root / "models" / "deepseek-v4-flash-0731-UD-IQ2_XXS"
+        self.assertEqual([c[2] for c in get], [folder / setup.DS4_SHARD.format(i=i) for i in range(1, 4)])
+        self.assertTrue(get[0][1].startswith(setup.hf(REPO4) + "UD-IQ2_XXS/"))
+        self.assertIn("fbbb5b93fb787c21338159b0af3318bb3f4d9768", get[0][1])
+        self.assertEqual(sum(1 for c in self.calls if c[0] == "sha"), 3)
+        self.assertNotIn("dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf", [c[2].name for c in get])
+        pack = " ".join(map(str, [c for c in self.calls if c[0] == "run"][-1][1]))
+        self.assertIn("pack_gguf.py", pack)
+        self.assertNotIn("--engram", pack)
+        self.assertNotIn("--shards", pack)
+        self.assertEqual(self.cfg["arch"], "deepseek4")
+        self.assertEqual(self.cfg["model_name"], "deepseek-v4-flash-0731")
+        a = self.cfg["args"]
+        self.assertEqual(a[a.index("--max-context") + 1], "8192")
+        self.assertEqual(a[a.index("--dspark") + 1], "none")                 # the drafter offers no drafts
+        self.assertNotIn("--dspark-conf", a)
+        self.assertNotIn("--tp", a)                                          # one card: the engine's own default
+        self.assertIn("DeepSeek-V4-Flash-0731", out)
+        self.assertIn("no n-gram table", out)
+        self.assertIn("11.8 tokens a second", out)
+
+    def test_own_files_are_checked_not_downloaded(self):
+        own = self.root / "own4"
+        own.mkdir()
+        for i in range(1, 4):
+            (own / setup.DS4_SHARD.format(i=i)).write_bytes(b"GGUF")
+        rc, out = self.install4(gguf_dir=str(own))
+        self.assertEqual(rc, 0, out)
+        self.assertFalse([c for c in self.calls if c[0] == "get"])
+        self.assertTrue(all(c[2] for c in self.calls if c[0] == "sha"))      # own=True: setup never deletes the person's file
+        pack = " ".join(map(str, [c for c in self.calls if c[0] == "run"][-1][1]))
+        self.assertIn(str(own), pack)
+
+    def test_a_missing_own_shard_is_said(self):
+        own = self.root / "own4"
+        own.mkdir()
+        for i in (1, 2):
+            (own / setup.DS4_SHARD.format(i=i)).write_bytes(b"GGUF")
+        rc, out = self.install4(gguf_dir=str(own))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("00003-of-00003.gguf is missing", out)
+
+    def test_one_size_is_chosen_automatically_and_little_ram_only_warns(self):
+        rc, out = self.install4(ram=32.0, model=None)                        # the version was not named on the command line
+        self.assertEqual(rc, 0, out)                                        # one size: no better one to send the person to
+        self.assertEqual(self.cfg["arch"], "deepseek4")
+        self.assertIn("installing UD-IQ2_XXS with 32 GB of RAM", out)
+        self.assertIn("More RAM or a bigger card makes it quicker", out)
 
 
 if __name__ == "__main__":

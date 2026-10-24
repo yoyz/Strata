@@ -560,10 +560,12 @@ class Strata:
         The download is the GGUF; the picture reader (mmproj, ~0.9 GB) is counted by the plan when pictures are on."""
         big = self.multi_family(family)
         if big and model in big["models"]:
-            # nine shards; the memory the weights need is VRAM + RAM together WITHOUT the n-gram table (it stays on the SSD)
+            # the shards (and the files shared between sets); the memory the weights need is VRAM + RAM together WITHOUT the n-gram
+            # table (V4.1 keeps it on the SSD; deepseek4 has none)
             gb = sum(big["sha256"][n][0] for n in [*big["models"][model]["shards"], *big["models"][model].get("shared", [])]) / 1e9
+            dense = float(big["models"][model].get("dense_gb", 17.0))
             return {"about": big["models"][model]["about"], "download_gb": round(gb, 1), "ram_gb": big["models"][model]["ram_gb"],
-                    "arena_gb": round(float(big["models"][model]["ram_gb"]) - 17.0, 1), "mem_total": True, "vision": False,
+                    "arena_gb": round(float(big["models"][model]["ram_gb"]) - dense, 1), "mem_total": True, "vision": False,
                     "engine": None, "families": (family,), "multi_file": True}
         d = (getattr(self.setup_module(), "OWN_PATH_FAMILIES", None) or {}).get(family)
         if not d or model not in d["models"]:
@@ -1291,7 +1293,10 @@ class Strata:
         `default`: what to answer when the tables cannot be read (the whole download)."""
         S = self.setup_module()
         try:
-            fam = S.MULTI_FILE_FAMILIES["deepseek41"]
+            fams = getattr(S, "MULTI_FILE_FAMILIES", None) or {}
+            fam = next((d for d in fams.values() if model in d["models"]), None)
+            if fam is None:
+                return default
             md = fam["models"][model]
             models = self.data_dir() / "models"
             folder, shared = models / (fam["tag"] + model), models / (fam["tag"] + "shared")
@@ -1299,10 +1304,10 @@ class Strata:
             for where, names in ((folder, md["shards"]), (shared, md.get("shared", []))):
                 for n in names:
                     for cand in (n, getattr(S, "DSV41_LEGACY_NAMES", {}).get(n)):
-                        if cand and (where / cand).is_file() and (where / cand).stat().st_size == S.DSV41_ALL_FILES[cand][0]:
+                        if cand and (where / cand).is_file() and (where / cand).stat().st_size == fam["sha256"][cand][0]:
                             break
                     else:
-                        left += S.DSV41_ALL_FILES[n][0]
+                        left += fam["sha256"][n][0]
             return left / 1e9
         except Exception:                                    # noqa: BLE001 - a hint for the menu: when unsure, count the whole download
             return default

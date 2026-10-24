@@ -302,10 +302,12 @@ class Catalog:
         return None
 
     def engine_vendor(self, hw: dict | None = None) -> str | None:
-        """The make of card the engine drives: the installed engine's; with none installed, the engine setup would fetch (NVIDIA first when the
-        computer has several makes)."""
-        from strata_control import gpu_fit
+        """The make of card the engine drives: what the hardware read already decided, else the installed engine's; with none
+        installed, the engine setup would fetch (NVIDIA first when the computer has several makes)."""
         hw = hw if hw is not None else self.hardware()
+        if hw.get("engine_vendor"):
+            return hw["engine_vendor"]              # no need to probe the machine (nvidia-smi / rocminfo) when it is known
+        from strata_control import gpu_fit
         return gpu_fit.pick_vendor(list(hw.get("gpus") or []), self.installed_backend())
 
     # ---- the tables

@@ -149,8 +149,22 @@ the comparison hooks for the validation step.
   - Then: 8K context, then speed with an expert profile (`tools/dsv41` has the profile tools; the shipped
     `profile-2.00.bin` is for the IST-DAS sets, not this model).
 
-- [ ] **5. Not started, after the engine matches:** the model in `setup.py`/`strata_control` (family, pin, sizes),
-  the server hand-off, and a `strata-dsv41` package for the feed.
+- [x] **5. It is a model Strata installs.** Done in this branch: the family `deepseek4` in `setup.py` (the pin:
+  Unsloth's `UD-IQ2_XXS`, three shards, SHA-256, revision `fbbb5b93`), its fit and plan in
+  `strata_control/dsv41_fit.py` (`DS4_*`: 43 layers, 256 experts, 11,008 experts, 90.86 GB, 83.87 GB of experts,
+  6.99 GB dense, no Engram table; measured on the RX 9070 XT: 701 experts in the card, 11.8 tokens a second), the
+  server hand-off (`serve/server.py` and `serve/frontend.py`: `deepseek-v4-flash-0731`, DSML calls, its end token,
+  the effort words, the slot environment; the model card's sampling 1.0/1.0), and the launch path (`--family
+  deepseek4`, `--model-path` recognising its three pinned shard names, tuning skipped, `--dsv41-package` passed).
+  Tests: `tools/test_setup_dsv41.py` (100 pass), `serve/test_dsv41.py`, `tests/terminal/test_launch_dsv41.py`,
+  `tests/terminal/test_dsv41_own_files_and_mmproj.py`, `tests/terminal/test_tokenizer_pre.py`.
+  - The tokenizer: the GGUF states `joyai-llm`; llama.cpp gives that name DeepSeek's regex sequence
+    (`src/llama-vocab.cpp`, the same list as `deepseek3`), and `tools/strata_tokenizer.py` matched only names
+    starting with `deepseek`, so it split the text with the Qwen pattern.  Its ids now match `llama-tokenize` on
+    the real shard for English, digits, CJK and punctuation.
+  - Left: a `strata-dsv41` package in the signed feed with this engine.  `packaging/package_engine.py
+    --require-dsv41` already takes it; until a package exists, setup finds no engine for `deepseek4` unless one is
+    named (`STRATA_DSV41_EXE` or `--dsv41-package`).
 
 ## The four bugs (item 4), and how each was found
 

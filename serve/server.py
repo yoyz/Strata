@@ -3510,7 +3510,7 @@ def child_env(cfg: dict, *, offline: bool = False) -> dict:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in ordered_gpus(cfg))
     for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries (AMD: the GEMM tuning table)
         env[str(k)] = str(v)
-    if (cfg.get("arch") or "") == "deepseek41":      # (only this engine reads these; Qwen's environment is untouched)
+    if (cfg.get("arch") or "") in DEEPSEEK_FAMILIES:      # (only this engine reads these; Qwen's environment is untouched)
         deepseek_slot_env(env, cfg)
     # Strict offline reaches children through the environment, because a tool subprocess or a model
     # loader is code this server does not own. Applied last so a profile's own `env` cannot remove
@@ -3938,10 +3938,10 @@ class Service:
                 else PromptEncoder(tokenizer)
 
     def set_family(self, family: str | None) -> None:
-        """A family whose text differs from the Qwen form this server was written for (DeepSeek-V4.1: its own end
+        """A family whose text differs from the Qwen form this server was written for (DeepSeek-V4.1 / V4-Flash: its own end
         token, DSML tool calls, reasoning-effort words).  The others keep the defaults."""
         self.family = family
-        if family == "deepseek41":
+        if family in DEEPSEEK_FAMILIES:
             from serve import dsml
             eos = (getattr(self.tok, "special_ids", None) or {}).get("eos", 1)
             self.stop_ids = {int(eos)}
@@ -8045,7 +8045,7 @@ def check_request_sampling(req) -> None:
 
 # the API's model name per model family (the GGUF architecture, "arch" in the config) when the config names none
 FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b",
-                      "deepseek41": "deepseek-v4.1-flash"}
+                      "deepseek41": "deepseek-v4.1-flash", "deepseek4": "deepseek-v4-flash-0731"}
 
 
 # The sampling each model card recommends ("Best Practices"), used when neither the request, the Chat settings nor the
@@ -8060,7 +8060,12 @@ MODEL_CARD_SAMPLING = {
                   "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
     # DeepSeek-V4.1-Flash: temperature 1.0, top_p 1.0 for local use (thinking or not), no penalties
     "deepseek41": {"thinking": {"temperature": 1.0, "top_p": 1.0}, "instruct": {"temperature": 1.0, "top_p": 1.0}},
+    # DeepSeek-V4-Flash-0731: the model card's local deployment line (temperature 1.0, top_p 1.0 outside agentic use; 0.95 for agents)
+    "deepseek4": {"thinking": {"temperature": 1.0, "top_p": 1.0}, "instruct": {"temperature": 1.0, "top_p": 1.0}},
 }
+
+# the families whose text (DSML calls, effort words, end token) differs from the Qwen form this server was written for
+DEEPSEEK_FAMILIES = ("deepseek41", "deepseek4")
 
 
 def model_card_sampling(arch, thinking) -> dict:
@@ -8446,7 +8451,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
-        svc.set_family(svc.model_arch if svc.model_arch == "deepseek41" else None)
+        svc.set_family(svc.model_arch if svc.model_arch in DEEPSEEK_FAMILIES else None)
         requested = cfg.get("parallel")
         if requested is None:
             args = cfg.get("args", [])

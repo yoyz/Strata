@@ -18,9 +18,11 @@ from tests.terminal.launch_support import HW_12, Home, catalog, run_cli
 R9700 = {"name": "AMD Radeon AI PRO R9700", "vram_gb": 32.0, "usable": True, "vendor": "amd"}
 HW_4X32 = {**HW_12, "ram_gb": 251.0, "disk_free_gb": 900.0, "engine_vendor": "amd",
            "gpus": [{**R9700, "index": i} for i in range(4)]}
+X9070 = {"name": "AMD Radeon RX 9070 XT", "vram_gb": 16.0, "usable": True, "vendor": "amd"}
+HW_9070 = {**HW_12, "ram_gb": 125.0, "disk_free_gb": 1400.0, "engine_vendor": "amd", "gpus": [{**X9070, "index": 0}]}
 
 
-class LaunchDeepSeek(unittest.TestCase):
+class _LaunchBase(unittest.TestCase):
     def setUp(self):
         self.home = Home().__enter__()
         self.addCleanup(self.home.__exit__, None, None, None)
@@ -34,6 +36,8 @@ class LaunchDeepSeek(unittest.TestCase):
         self.assertEqual(code, 0, err + out)
         return json.loads(out)["plan"]
 
+
+class LaunchDeepSeek(_LaunchBase):
     def test_the_model_is_in_the_list(self):
         rows = [r for r in catalog(self.hw).rows() if r.family == "deepseek41"]
         self.assertEqual([r.model for r in rows], ["IST-DAS-2.00bpw", "IST-DAS-2.25bpw", "IST-DAS-1.75bpw", "UD-Q8_K_XL"])
@@ -123,7 +127,7 @@ class LaunchDeepSeek(unittest.TestCase):
         self.assertIsNone(Runner(s, catalog=catalog(self.hw)).catalog_parallel())
 
 
-class OwnShards(unittest.TestCase):
+class OwnShardsBase(unittest.TestCase):
     def setUp(self):
         self.home = Home().__enter__()
         self.addCleanup(self.home.__exit__, None, None, None)
@@ -132,6 +136,11 @@ class OwnShards(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
+    def runner(self, path):
+        return Runner(S.LaunchSettings(model_path=str(path)), catalog=catalog(self.hw))
+
+
+class OwnShards(OwnShardsBase):
     def folder(self, shards=range(1, 10), nested=False):
         base = Path(os.environ["STRATA_INSTALL_DIR"]) / "ds"
         folder = base / "UD-Q8_K_XL" if nested else base
@@ -139,9 +148,6 @@ class OwnShards(unittest.TestCase):
         for i in shards:
             (folder / f"DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-{i:05d}-of-00009.gguf").write_bytes(b"GGUF")
         return base, folder
-
-    def runner(self, path):
-        return Runner(S.LaunchSettings(model_path=str(path)), catalog=catalog(self.hw))
 
     def test_a_folder_of_the_nine_shards_is_the_model(self):
         _base, folder = self.folder()
@@ -174,6 +180,79 @@ class OwnShards(unittest.TestCase):
         self.assertEqual(code, 0, err + out)
         self.assertIn("DeepSeek-V4.1-Flash", out)
         self.assertIn("Nothing to download", out)
+
+
+class LaunchDeepSeek4(_LaunchBase):
+    """DeepSeek-V4-Flash-0731 in the same menu: one size, its own numbers (strata_control/dsv41_fit.py DS4_*), no tuning, no
+    drafter.  The measurements are the port's own (docs/DEEPSEEK4_PORT.md): a 16 GB RX 9070 XT with 125 GB of RAM."""
+
+    def setUp(self):
+        super().setUp()
+        self.hw = dict(HW_9070)
+
+    def test_the_model_is_in_the_list(self):
+        rows = [r for r in catalog(self.hw).rows() if r.family == "deepseek4"]
+        self.assertEqual([r.model for r in rows], ["UD-IQ2_XXS"])
+        r = rows[0]
+        self.assertEqual((r.id, r.download_gb, r.verdict, r.images), ("deepseek-v4-flash-0731-ud-iq2_xxs", 90.9, "fits", False))
+        self.assertEqual(catalog(self.hw).resolve("ud-iq2_xxs"), ("deepseek4", "UD-IQ2_XXS"))
+        self.assertEqual(catalog(self.hw).max_context("deepseek4", "UD-IQ2_XXS"), 8192)
+
+    def test_the_plan_on_a_16_gb_card(self):
+        p = self.plan("--family", "deepseek4", "--model", "ud-iq2_xxs", "--no-tui")
+        self.assertEqual((p["settings"]["family"], p["settings"]["context"], p["settings"]["tune"], p["settings"]["vision"]),
+                         ("deepseek4", 8192, "skip", "off"))
+        pl = p["placement"]
+        self.assertEqual(pl["verdict"], "fits")
+        self.assertEqual(pl["args"], [])                                  # one card: the engine's own default
+        self.assertLess(abs(pl["experts_in_vram"] - 701), 80)             # measured: 701 of 11,008 in the card
+        text = " ".join(pl["lines"])
+        self.assertIn("no n-gram table", text)
+        self.assertIn("11.8 tokens a second", text)
+        self.assertIn("91 GB", text)
+
+    def test_setup_is_asked_for_the_family_and_the_files(self):
+        s = S.LaunchSettings(family="deepseek4", model="UD-IQ2_XXS", context=8192, vision="off", tune="skip", model_path="/data/ds4")
+        args = Runner(s, catalog=catalog(self.hw)).setup_args()
+        self.assertEqual(args[:6], ["--yes", "--no-start", "--family", "deepseek4", "--model", "UD-IQ2_XXS"])
+        self.assertIn("--gguf-dir", args)
+        self.assertNotIn("--parallel", args)
+        self.assertIsNone(Runner(s, catalog=catalog(self.hw)).catalog_parallel())
+
+
+class OwnShards4(OwnShardsBase):
+    """`--model-path` with DeepSeek-V4-Flash-0731's three shards."""
+
+    def setUp(self):
+        super().setUp()
+        self.hw = dict(HW_9070)
+
+    def folder4(self, shards=range(1, 4), nested=False):
+        base = Path(os.environ["STRATA_INSTALL_DIR"]) / "ds4"
+        folder = base / "UD-IQ2_XXS" if nested else base
+        folder.mkdir(parents=True, exist_ok=True)
+        for i in shards:
+            (folder / f"DeepSeek-V4-Flash-0731-UD-IQ2_XXS-{i:05d}-of-00003.gguf").write_bytes(b"GGUF")
+        return base, folder
+
+    def test_a_folder_of_the_three_shards_is_the_model(self):
+        _base, folder = self.folder4()
+        r = self.runner(folder)
+        r.check_own_files()
+        self.assertEqual((r.s.family, r.s.model, r.s.model_path), ("deepseek4", "UD-IQ2_XXS", str(folder)))
+
+    def test_the_folder_with_the_size_inside(self):
+        base, folder = self.folder4(nested=True)
+        r = self.runner(base)
+        r.check_own_files()
+        self.assertEqual((r.s.family, r.s.model, r.s.model_path), ("deepseek4", "UD-IQ2_XXS", str(folder)))
+
+    def test_a_missing_shard_says_three_parts(self):
+        _base, folder = self.folder4(shards=[1, 2])
+        with self.assertRaises(LaunchError) as cm:
+            self.runner(folder).check_own_files()
+        self.assertIn("three parts", cm.exception.text)
+        self.assertIn("00003-of-00003", cm.exception.text)
 
 
 if __name__ == "__main__":

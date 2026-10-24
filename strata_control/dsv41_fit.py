@@ -1,7 +1,12 @@
-"""Where DeepSeek-V4.1-Flash goes on a computer: the real numbers of the model and its engine, in one place.
+"""Where the DeepSeek models go on a computer: the real numbers of each model and its engine, in one place.
 
-The model is 40 layers of 384 routed experts (top 6) beside dense attention weights.  Unsloth's UD-Q8_K_XL (the
-file Strata runs, pinned in setup.py) is 508.4 GB in nine shards:
+Two models, one engine (strata-dsv41): DeepSeek-V4.1-Flash ("deepseek41", 40 layers of 384 experts, an Engram
+n-gram table) and DeepSeek-V4-Flash-0731 ("deepseek4", 43 layers of 256 experts, no Engram table).  The geometry
+below is per model and `plan()` dispatches on the family (or on the size's name); every threshold and every speed
+says where it was measured.
+
+The DeepSeek-V4.1-Flash numbers follow.  The model is 40 layers of 384 routed experts (top 6) beside dense attention
+weights.  Unsloth's UD-Q8_K_XL (the file Strata runs, pinned in setup.py) is 508.4 GB in nine shards:
 
   routed experts, MXFP4      288.8 GB   15,360 experts of 18.8 MB (40 layers x 384)
   dense weights, BF16 / F32   16.8 GB   attention, router, shared experts, the head (the embedding table stays on the CPU)
@@ -79,6 +84,128 @@ ISTA_MEASURED = ("an RTX 5070 (12 GB) with 64 GB of RAM and a 3.6 GB/s NVMe driv
                  "about 31 tokens a second")
 
 
+# DeepSeek-V4-Flash-0731 ("deepseek4", setup.py DS4_FILES): Unsloth's UD-IQ2_XXS, three shards, 90.86 GB.  43 layers of 256 routed experts
+# (top 6, 1 shared), hidden 4096, 8 hyper-connections, compress ratios 0/4/128, no Engram table (the 202.8 GB table V4.1 reads from the SSD
+# does not exist here).  The numbers come from the pack the engine builds (--pack-info, 2026-10-25): 11008 experts at 7,619,000 bytes each
+# (83.87 GB), dense weights 6.99 GB (the embedding 0.30 GB stays on the CPU), so the memory the model needs is 90.86 GB.
+# Measured (this PC, 2026-10-25, f-dsv41-ds4 75014c92): RX 9070 XT 16 GiB (17.1 GB), 125 GiB of RAM, one NVMe, 8192 context, no drafter:
+# 701 of 11008 experts in the card (5.69 GB), dense 6.77 GB, the engine's buffers and the 1 GB reserve 4.7 GB, 10307 experts (78.8 GB) on
+# the CPU lane; 11.8 tokens a second with the RAM store at 48 GB (94.5% of the CPU's experts cached), and 199 tokens a second reading a
+# 2,200-token prompt (319 warm).  With a cold store it streams about four times as much and runs at 9-10 tokens a second.
+DS4_LAYERS = 43
+DS4_EXPERTS_PER_LAYER = 256
+DS4_EXPERTS = DS4_LAYERS * DS4_EXPERTS_PER_LAYER          # 11,008
+DS4_SET_BYTES = 90_860_736_928                            # the three UD-IQ2_XXS shards (setup.py DS4_FILES)
+DS4_EXPERT_BYTES = 83_869_302_784                         # 43 layers x 256 experts (two layers carry other quant types)
+DS4_EXPERT_GB = DS4_EXPERT_BYTES / GB / DS4_EXPERTS       # 7.62 MB each
+DS4_WEIGHTS_GB = DS4_SET_BYTES / GB                       # 90.86
+DS4_EXPERTS_GB = DS4_EXPERT_BYTES / GB                    # 83.87
+DS4_DENSE_GB = DS4_WEIGHTS_GB - DS4_EXPERTS_GB            # 6.99
+DS4_DENSE_ON_GPU_GB = 6.77                                # measured: the card held the dense weights of all 43 layers
+DS4_RESERVE_GB = 4.7                                      # per card, measured: the engine's buffers + the 1 GB --reserve-mib (6.77 + 5.69 + 4.7 = 17.1)
+DS4_DOWNLOAD_GB = DS4_WEIGHTS_GB
+DS4_REST_RAM_GB = 9.0
+DS4_RAM_OK_GB = 64.0                 # the engine's default RAM store is 48 GB; 64 GB of RAM leaves room for the system (estimated: not measured under 125 GB)
+DS4_RAM_GREAT_GB = 128.0
+DS4_MEASURED = ("an RX 9070 XT (16 GB) with 125 GB of RAM and one NVMe drive: 701 of the 11,008 experts in the card's memory, answers at "
+                "11.8 tokens a second, a 2,200-token prompt read at 199 tokens a second (319 warm); a cold RAM store streams about four times "
+                "as much and runs at 9-10 tokens a second")
+DS4_UNMEASURED = "DeepSeek-V4-Flash-0731 has been run on one card only: several cards are untested, and so is less than 125 GB of RAM"
+DS4_MODELS = ("UD-IQ2_XXS",)         # the sizes setup.py offers for deepseek4
+
+
+def is_deepseek4(model: str | None, family: str | None = None) -> bool:
+    """True for DeepSeek-V4-Flash-0731: by the launch's family, or by its only size's name when no family was passed."""
+    return family == "deepseek4" or (family is None and str(model or "").lower() in {m.lower() for m in DS4_MODELS})
+
+
+def _plan_ds4(cards: list[dict] | None, ram_gb: float | None, disk_free_gb: float | None, context: int,
+              vendor: str | None) -> dict[str, Any]:
+    """plan() for DeepSeek-V4-Flash-0731: measured on one RX 9070 XT (16 GB) with 125 GB of RAM; everything else is an estimate and is
+    said as one.  Never a refusal."""
+    keep, ignored = gpu_fit.usable_cards(gpu_fit.for_vendor(list(cards or []), vendor)[0]) if vendor else gpu_fit.usable_cards(list(cards or []))
+    keep = [c for c in keep if float(c.get("vram_gb") or 0) >= SMALLEST_CARD_GB]
+    keep.sort(key=lambda c: c.get("index", 0))
+    n = len(keep)
+    out: dict[str, Any] = {"variant": None, "cards": [], "experts_total": DS4_EXPERTS, "experts_in_vram": 0, "vram_experts_gb": 0.0,
+                           "cpu_experts_gb": DS4_EXPERTS_GB, "weights_gb": _round1(DS4_WEIGHTS_GB), "experts_gb": _round1(DS4_EXPERTS_GB),
+                           "dense_gb": _round1(DS4_DENSE_GB), "engram_gb": 0.0, "download_gb": _round1(DS4_DOWNLOAD_GB),
+                           "tp": tp_for(n), "args": [], "measured": DS4_MEASURED, "lines": [], "warnings": [], "ram_gb": ram_gb,
+                           "context": context, "disk_total_gb": _round1(DS4_DOWNLOAD_GB), "model": "UD-IQ2_XXS"}
+    need_disk = DS4_DOWNLOAD_GB + DISK_HEADROOM_GB
+    out["disk_need_gb"] = _round1(need_disk)
+    out["disk_ok"] = None if disk_free_gb is None else disk_free_gb >= need_disk
+    lines, warns = out["lines"], out["warnings"]
+    lines.append(f"DeepSeek-V4-Flash-0731 (UD-IQ2_XXS): a {DS4_DOWNLOAD_GB:.0f} GB download. In memory it needs {DS4_WEIGHTS_GB:.0f} GB: "
+                 f"{DS4_EXPERTS_GB:.0f} GB of experts ({DS4_EXPERTS:,} of {DS4_EXPERT_GB * 1000:.1f} MB) and {DS4_DENSE_GB:.1f} GB of attention "
+                 "and other dense weights.")
+    lines.append("There is no n-gram table in this model: what RAM cannot hold is read in place from its own files, so use an NVMe drive "
+                 "(a slow disk makes every word slower).")
+    if n == 0:
+        out["verdict"] = "no_card"
+        warns.append("No graphics card Strata can use was found: this model needs one or more cards (it was measured on a 16 GB RX 9070 XT).")
+    else:
+        per_dense = DS4_DENSE_ON_GPU_GB / n
+        cap = [max(0.0, _cap_gb(float(c.get("vram_gb") or 0)) - per_dense - DS4_RESERVE_GB) for c in keep]
+        vram_exp = min(DS4_EXPERTS_GB, sum(cap))
+        ranges = split_layers([float(c.get("vram_gb") or 0) for c in keep], DS4_LAYERS)
+        in_vram = 0
+        for c, room, (a, b) in zip(keep, cap, ranges):
+            gb = min(room, vram_exp * (room / sum(cap))) if sum(cap) else 0.0
+            ne = min(int(gb / DS4_EXPERT_GB), (b - a + 1) * DS4_EXPERTS_PER_LAYER)
+            in_vram += ne
+            out["cards"].append({"index": c.get("index"), "name": c.get("name"), "vram_gb": float(c.get("vram_gb") or 0), "layers": [a, b],
+                                 "dense_gb": _round1(per_dense), "experts_gb": _round1(ne * DS4_EXPERT_GB), "experts": ne})
+        out["experts_in_vram"] = in_vram
+        out["vram_experts_gb"] = _round1(in_vram * DS4_EXPERT_GB)
+        out["cpu_experts_gb"] = _round1(DS4_EXPERTS_GB - in_vram * DS4_EXPERT_GB)
+        out["tp"] = tp_for(n, keep)
+        out["args"] = _tp_args(n, out["tp"])
+        names = " + ".join(f"{c['name'] or 'card ' + str(c['index'])} ({c['vram_gb']:.0f} GB)" for c in out["cards"])
+        lines.append(f"Graphics memory: {names}. About {in_vram:,} of the {DS4_EXPERTS:,} experts ({out['vram_experts_gb']:.1f} GB) stay on "
+                     f"the card{'s' if n > 1 else ''}; the other {DS4_EXPERTS - in_vram:,} ({out['cpu_experts_gb']:.0f} GB) are computed on the "
+                     "CPU from RAM, and the ones RAM cannot hold are read from the SSD when a word needs them.")
+        if n >= 2:
+            lines.append("Two cards share each layer's matrices (--tp 2): this model has been run on one card only, so several cards are untested.")
+        if ram_gb:
+            all_cached = out["cpu_experts_gb"] + DS4_REST_RAM_GB
+            out["ram_needed_gb"] = _round1(all_cached)
+            out["spill_gb"] = _round1(max(0.0, all_cached - float(ram_gb)))
+            out["spare_ram_gb"] = _round1(max(0.0, float(ram_gb) - all_cached))
+            if float(ram_gb) >= all_cached:
+                out["verdict"] = "fits"
+                lines.append(f"That fits this computer: {ram_gb:.0f} GB of RAM keeps all {out['cpu_experts_gb']:.0f} GB of the CPU's experts cached.")
+            elif float(ram_gb) >= DS4_RAM_OK_GB:
+                out["verdict"] = "tight"
+                lines.append(f"This computer has {ram_gb:.0f} GB of RAM: Strata keeps the experts you use most in RAM (its default store is 48 GB) "
+                             "and reads the rest from the SSD. Measured: 11.8 tokens a second with 125 GB of RAM and a 16 GB card.")
+            else:
+                out["verdict"] = "spills"
+                warns.append(f"This computer has {ram_gb:.0f} GB of RAM and this model was measured with 125 GB. With less, a large part of the "
+                             "experts comes from the SSD while it answers: it works but is slow, and the store it keeps is smaller than its "
+                             "default. It is still allowed.")
+        else:
+            out["verdict"] = "unknown"
+        short = [c for c in keep if _cap_gb(float(c.get("vram_gb") or 0)) < per_dense + DS4_RESERVE_GB + 1.0]
+        if short:
+            warns.append(f"The dense weights need ~{per_dense:.1f} GB of graphics memory and {short[0].get('name') or 'a card'} "
+                         f"({float(short[0].get('vram_gb') or 0):.0f} GB) has hardly that: the engine may stop at the start. It is still allowed.")
+        if ignored:
+            lines.append("Not used: " + "; ".join(f"{c.get('name') or 'a card'} ({c.get('why_ignored')})" for c in ignored) + ".")
+        lines.append("Measured on " + DS4_MEASURED + ". Other computers are slower or faster by what their cards, RAM and drive can do.")
+    if disk_free_gb is not None and disk_free_gb < need_disk:
+        warns.append(f"The download needs about {need_disk:.0f} GB of free disk space and {disk_free_gb:.0f} GB are free where the files go. "
+                     "Use --models-dir on a bigger drive, or --gguf-dir for files you already have.")
+    out["words"] = " ".join(lines)
+    return out
+
+
+def family_of(model: str | None, family: str | None = None) -> str:
+    """The family a size belongs to: the one passed, else deepseek4 for its only size, else deepseek41."""
+    return family or ("deepseek4" if is_deepseek4(model) else "deepseek41")
+
+
+
 def variant(model: str | None) -> dict | None:
     """The official-set entry for a model name (case-insensitive), None for UD-Q8_K_XL and anything else."""
     if not model:
@@ -95,9 +222,12 @@ def ista_download_bytes(model: str, have_engram: bool = False) -> int:
     return v["set_bytes"] + ISTA_DSPARK_BYTES + ISTA_META_BYTES + (0 if have_engram else ISTA_ENGRAM_BYTES)
 
 
-def recommend(ram_gb: float | None, disk_free_gb: float | None = None) -> str:
-    """The official set that suits this computer: 2.00 bpw, unless its memory (under the measured 40 GB of RAM) or its disk (under 2.00's need but
-    enough for the smaller one) make the 1.75 bpw set the better start.  Only a recommendation: every set can still be chosen."""
+def recommend(ram_gb: float | None, disk_free_gb: float | None = None, family: str | None = None) -> str:
+    """The set that suits this computer: 2.00 bpw, unless its memory (under the measured 40 GB of RAM) or its disk (under 2.00's need but
+    enough for the smaller one) make the 1.75 bpw set the better start.  Only a recommendation: every set can still be chosen.  For
+    deepseek4 there is one size, so it is always that one."""
+    if family == "deepseek4":
+        return DS4_MODELS[0]
     big, small = "IST-DAS-2.00bpw", "IST-DAS-1.75bpw"
     if ram_gb is not None and float(ram_gb) < ISTA_SETS[big]["ram_ok_gb"]:
         return small
@@ -246,14 +376,17 @@ def _plan_ista(model: str, cards: list[dict] | None, ram_gb: float | None, disk_
 
 
 def plan(cards: list[dict] | None, ram_gb: float | None, disk_free_gb: float | None = None, context: int = 8192,
-         vendor: str | None = None, model: str | None = None) -> dict[str, Any]:
+         vendor: str | None = None, model: str | None = None, family: str | None = None) -> dict[str, Any]:
     """Where the model goes on this computer.  `cards`: the graphics cards ({"index", "name", "vram_gb", ...}, as gpu_fit takes them),
     `ram_gb` the RAM, `disk_free_gb` the free space where the files go (None: not checked).  `model`: an official IST-DAS set
-    (ISTA_SETS: "IST-DAS-2.00bpw" / "IST-DAS-2.25bpw" / "IST-DAS-1.75bpw") gets its own numbers; None or "UD-Q8_K_XL" is Unsloth's 508 GB set.
+    (ISTA_SETS: "IST-DAS-2.00bpw" / "IST-DAS-2.25bpw" / "IST-DAS-1.75bpw") gets its own numbers; None or "UD-Q8_K_XL" is Unsloth's 508 GB
+    set.  `family` "deepseek4" (or the size "UD-IQ2_XXS") is DeepSeek-V4-Flash-0731.
 
     Keys: cards (per card: index, name, vram_gb, layers, dense_gb, experts_gb, experts), experts_in_vram, experts_total, vram_experts_gb,
     cpu_experts_gb, ram_needed_gb, spill_gb, spare_ram_gb, verdict (fits / tight / spills / unknown / no_card), tp, args,
     download_gb, engram_gb, disk_need_gb, disk_ok, lines (plain words, one idea each), warnings (the risks, plainly), measured."""
+    if is_deepseek4(model, family):
+        return _plan_ds4(cards, ram_gb, disk_free_gb, context, vendor)
     if variant(model):
         return _plan_ista(variant_key(model), cards, ram_gb, disk_free_gb, context, vendor)
     keep, ignored = gpu_fit.usable_cards(gpu_fit.for_vendor(list(cards or []), vendor)[0]) if vendor else gpu_fit.usable_cards(list(cards or []))
@@ -355,8 +488,9 @@ def plan(cards: list[dict] | None, ram_gb: float | None, disk_free_gb: float | N
     return out
 
 
-def _option(key: str, cards: list[dict], ram_gb: float | None, ctx: int, vendor: str | None, model: str | None = None) -> dict[str, Any]:
-    p = plan(cards, ram_gb, None, ctx, vendor, model)
+def _option(key: str, cards: list[dict], ram_gb: float | None, ctx: int, vendor: str | None, model: str | None = None,
+            family: str | None = None) -> dict[str, Any]:
+    p = plan(cards, ram_gb, None, ctx, vendor, model, family)
     names = " + ".join(gpu_fit._name(c) for c in cards)
     label = f"{names} + RAM" if len(cards) == 1 else f"{names} + RAM (layers shared, --tp {p['tp']})"
     words = {"fits": f"fits: {p['experts_in_vram']:,} of {p['experts_total']:,} experts in graphics memory, the rest computed on the CPU "
@@ -371,7 +505,8 @@ def _option(key: str, cards: list[dict], ram_gb: float | None, ctx: int, vendor:
             "recommended": False, "plan": p}
 
 
-def options(cards: list[dict], ram_gb: float | None, vendor: str | None = None, context: int = 8192, model: str | None = None) -> dict[str, Any]:
+def options(cards: list[dict], ram_gb: float | None, vendor: str | None = None, context: int = 8192, model: str | None = None,
+            family: str | None = None) -> dict[str, Any]:
     """gpu_fit.options for this model: every card that counts (recommended: the model is bigger than any one card, so each card adds
     experts that stay off the CPU), and the largest card alone.  Same keys as gpu_fit.options."""
     mine, others = gpu_fit.for_vendor(list(cards or []), vendor) if vendor else (list(cards or []), [])
@@ -381,9 +516,9 @@ def options(cards: list[dict], ram_gb: float | None, vendor: str | None = None, 
                            "other_vendor_note": gpu_fit.other_vendor_note(list(cards or []), vendor)}
     if not keep:
         return out
-    opts = [_option("all", sorted(keep, key=lambda c: c.get("index", 0)), ram_gb, context, vendor, model)]
+    opts = [_option("all", sorted(keep, key=lambda c: c.get("index", 0)), ram_gb, context, vendor, model, family)]
     if len(keep) > 1:
-        opts.append(_option("single", [keep[0]], ram_gb, context, vendor, model))
+        opts.append(_option("single", [keep[0]], ram_gb, context, vendor, model, family))
     opts[0]["recommended"] = True
     out["options"], out["recommended"] = opts, "all"
     return out

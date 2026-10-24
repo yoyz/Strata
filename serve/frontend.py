@@ -136,9 +136,11 @@ EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false":
 
 
 # DeepSeek-V4.1's template takes low, medium, high (its default) and max, or a whole number 1..100 (the "Reasoning
-# Effort: N" line of its prompt).  use_family("deepseek41") switches the table; the other families keep the one above.
+# Effort: N" line of its prompt).  use_family("deepseek41") switches the table (DeepSeek-V4-Flash-0731's template
+# takes the same words); the other families keep the one above.
 EFFORT_DEEPSEEK = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
                    "low": "low", "medium": "medium", "high": "high", "xhigh": "max", "max": "max", "maximum": "max"}
+DEEPSEEK_FAMILIES = ("deepseek41", "deepseek4")
 _EFFORT_QWEN = dict(EFFORT)
 _NUMERIC_EFFORT = False
 
@@ -147,8 +149,8 @@ def use_family(family: str | None) -> None:
     """The reasoning-effort words of the model family this server runs (module state, like ENV_TO_USER)."""
     global _NUMERIC_EFFORT
     EFFORT.clear()
-    EFFORT.update(EFFORT_DEEPSEEK if family == "deepseek41" else _EFFORT_QWEN)
-    _NUMERIC_EFFORT = family == "deepseek41"
+    EFFORT.update(EFFORT_DEEPSEEK if family in DEEPSEEK_FAMILIES else _EFFORT_QWEN)
+    _NUMERIC_EFFORT = family in DEEPSEEK_FAMILIES
 
 
 def effort_kwargs(value) -> dict:

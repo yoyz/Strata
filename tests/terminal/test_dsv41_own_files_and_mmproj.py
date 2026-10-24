@@ -84,20 +84,30 @@ class OwnDeepSeekFiles(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
             self.touch_set(d / "a", new)
-            self.assertEqual(Runner.deepseek_set_in(setup, d / "a")[0], "IST-DAS-2.00bpw")
+            self.assertEqual(Runner.deepseek_set_in(setup, d / "a")[1], "IST-DAS-2.00bpw")
             old = ["model-2.25bpw-%05d-of-00004.gguf" % i for i in range(1, 5)]
             self.touch_set(d / "b" / "2.25bpw", old)
-            m, _entry, folder = Runner.deepseek_set_in(setup, d / "b")
+            _family, m, _entry, folder = Runner.deepseek_set_in(setup, d / "b")
             self.assertEqual((m, folder), ("IST-DAS-2.25bpw", d / "b" / "2.25bpw"))
             ud = [setup.DSV41_SHARD.format(i=i) for i in range(1, 10)]
             self.touch_set(d / "c" / "UD-Q8_K_XL", ud)
-            self.assertEqual(Runner.deepseek_set_in(setup, d / "c")[0], "UD-Q8_K_XL")
+            self.assertEqual(Runner.deepseek_set_in(setup, d / "c")[1], "UD-Q8_K_XL")
 
     def test_other_models_files_are_not_deepseeks(self):
         from strata_cli.launch.runner import Runner
         with tempfile.TemporaryDirectory() as d:
             self.touch_set(Path(d), ["Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf"])
             self.assertIsNone(Runner.deepseek_set_in(setup, Path(d)))
+
+    def test_deepseek4_shards_are_recognised_too(self):
+        # the same pinned-name rule for DeepSeek-V4-Flash-0731 (three shards, its own folder)
+        from strata_cli.launch.runner import Runner
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            self.touch_set(d / "UD-IQ2_XXS", [setup.DS4_SHARD.format(i=i) for i in range(1, 4)])
+            family, model, _entry, folder = Runner.deepseek_set_in(setup, d)
+            self.assertEqual((family, model, folder), ("deepseek4", "UD-IQ2_XXS", d / "UD-IQ2_XXS"))
+            self.assertEqual(Runner.deepseek_set_in(setup, d / "UD-IQ2_XXS")[1], "UD-IQ2_XXS")
 
     def screen(self, settings):
         from strata_cli.launch.screens import ModelScreen

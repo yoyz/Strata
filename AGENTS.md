@@ -78,17 +78,24 @@ end of every run - profile it once with a few thousand tokens, then the table ab
 
 ## The next step
 
-**Item 5: make it a model Strata installs.**
+**Item 5 is done: it is a model Strata installs.** `strata launch --family deepseek4 --model UD-IQ2_XXS` plans it,
+fetches the three pinned shards (or takes `--gguf-dir`/`--model-path` for files already here), builds the pack,
+runs the 16-token check, and writes a run config with `--dspark none`.  The server knows the family (model name,
+DSML calls, its end token, the effort words, the slot environment); the launch list shows it and takes its three
+shard names as the model.  Files: `setup.py` (`DS4_*`, the family entry), `strata_control/dsv41_fit.py` (`DS4_*`,
+`_plan_ds4`), `serve/server.py` and `serve/frontend.py` (`DEEPSEEK_FAMILIES`), `strata_cli/launch/{runner,screens,
+app,catalog}.py`, `tools/strata_mcp.py`.  Tests: `tools/test_setup_dsv41.py` (100), the DS4 cases in
+`serve/test_dsv41.py` and `tests/terminal/test_launch_dsv41.py`, and `tests/terminal/test_tokenizer_pre.py`.
 
-1. `setup.py` / `strata_control`: the family (`deepseek4`), the download pins (unsloth's `UD-IQ2_XXS`, its 3 shards,
-   SHA-256), the sizes for `--plan` and `--check` (`strata_control/dsv41_fit.py` knows the V4.1 layout, not this
-   one: 11008 experts, 6 a token, no Engram table), and the run's settings (8192 context, `--dspark none` until the
-   drafter works).
-2. The server hand-off: `serve/server.py` runs `strata-dsv41` for V4.1 by engine name; this model needs its family
-   entry (name, template, thinking on by default) and a run of `serve/test_dsv41.py` and `serve/test_family_name.py`.
-3. A `strata-dsv41` package for the signed feed (`packaging/package_engine.py`, `packaging/feed_tool.py`, the release
-   notes).  None exists for this model: today it is a source build.
-4. Then, in any order: the DSpark drafter (it offers 0 drafts - the drafter blocks need the same kind of port), the
+The tokenizer needed one fix found on the way: the GGUF says `joyai-llm`, which llama.cpp gives DeepSeek's regex
+sequence; `tools/strata_tokenizer.py` matched only names starting with `deepseek`, so it split with the Qwen
+pattern.  Its ids now match `llama-tokenize` on the real shard.
+
+1. Still missing for a stranger's PC: **a `strata-dsv41` package in the signed feed with this engine**.  The
+   packaging tools already take it (`packaging/package_engine.py --require-dsv41`); what is missing is the build,
+   the version and the feed entry.  Until then, setup finds no engine for this model unless a build is named:
+   `STRATA_DSV41_EXE=/path/to/build-dsv41/strata-dsv41` (or `--dsv41-package`).
+2. Then, in any order: the DSpark drafter (it offers 0 drafts - the drafter blocks need the same kind of port), the
    8K-context comparison against llama.cpp, and a shipped expert profile for this pack (the shipped
    `data/dsv41/profile-2.00.bin` is for the IST-DAS V4.1 sets).
 

@@ -749,7 +749,7 @@ class Runner:
         if s.model_path:
             p = Path(s.model_path)
             args += ["--gguf-dir", str(p if p.is_dir() else p.parent)]
-        if s.dsv41_package and s.family == "deepseek41":
+        if s.dsv41_package and s.family in ("deepseek41", "deepseek4"):
             args += ["--dsv41-package", s.dsv41_package]
         if s.gpu_roles:
             args += ["--gpu-roles", ",".join(f"{k}={v}" for k, v in sorted(s.gpu_roles.items(), key=lambda kv: int(kv[0])))]
@@ -1094,23 +1094,25 @@ class Runner:
 
     @staticmethod
     def deepseek_set_in(mod, model_path, prefer: str | None = None):
-        """(set name, its catalog entry, the folder) when `model_path` (a folder, the folder above the set's own folder, or one shard) holds shards
-        of an official DeepSeek-V4.1-Flash set - recognised by the pinned shard names (the first release's names too), never by the generic GGUF
-        fingerprint table, which does not know DeepSeek (its shard 8 is a table, not a layer: "could not be read", #3914) - else None."""
-        fam = getattr(mod, "MULTI_FILE_FAMILIES", {}).get("deepseek41")
-        if fam is None or not model_path:
+        """(family, set name, its catalog entry, the folder) when `model_path` (a folder, the folder above the set's own folder, or one shard)
+        holds shards of a DeepSeek set in setup.py's MULTI_FILE_FAMILIES - recognised by the pinned shard names (the first release's names
+        too), never by the generic GGUF fingerprint table, which does not know DeepSeek (V4.1's shard 8 is a table, not a layer: "could not
+        be read", #3914) - else None."""
+        fams = getattr(mod, "MULTI_FILE_FAMILIES", {}) or {}
+        if not fams or not model_path:
             return None
         p = Path(model_path)
         legacy = getattr(mod, "DSV41_LEGACY_NAMES", {})
-        order = ([prefer] if prefer in fam["models"] else []) + [m for m in fam["models"] if m != prefer]
-        for m in order:
-            d = fam["models"][m]
-            subs = [d.get("subdir"), d.get("legacy_subdir"), m]
-            folders = [p, *[p / x for x in subs if x]] if p.is_dir() else [p.parent]
-            names = [n for s in d["shards"] for n in (s, legacy.get(s)) if n]
-            folder = next((f for f in folders if any((f / n).exists() for n in names)), None)
-            if folder is not None:
-                return m, d, folder
+        for family, fam in fams.items():
+            order = ([prefer] if prefer in fam["models"] else []) + [m for m in fam["models"] if m != prefer]
+            for m in order:
+                d = fam["models"][m]
+                subs = [d.get("subdir"), d.get("legacy_subdir"), m]
+                folders = [p, *[p / x for x in subs if x]] if p.is_dir() else [p.parent]
+                names = [n for s in d["shards"] for n in (s, legacy.get(s)) if n]
+                folder = next((f for f in folders if any((f / n).exists() for n in names)), None)
+                if folder is not None:
+                    return family, m, d, folder
         return None
 
     def deepseek_files(self) -> bool:
@@ -1121,29 +1123,29 @@ class Runner:
         s = self.s
         try:
             mod = self.catalog.strata.setup_module()
-            fam = getattr(mod, "MULTI_FILE_FAMILIES", {}).get("deepseek41")
-            if fam is None or not s.model_path:
+            if not getattr(mod, "MULTI_FILE_FAMILIES", None) or not s.model_path:
                 return False
             found = self.deepseek_set_in(mod, s.model_path, s.model)
         except Exception:                                    # noqa: BLE001 - not DeepSeek's: the usual check goes on
             return False
         if found is None:
             return False
-        model, d, folder = found
-        if s.family and s.family != "deepseek41":
-            raise LaunchError(f"These are DeepSeek-V4.1-Flash's files, not {s.family} {s.model}'s.",
+        family, model, d, folder = found
+        title = mod.MULTI_FILE_FAMILIES[family]["title"]
+        if s.family and s.family != family:
+            raise LaunchError(f"These are {title}'s files, not {s.family} {s.model}'s.",
                               "Leave --model out, or use --model " + model + ".", 2)
         others = list(d["shards"])
         legacy = getattr(mod, "DSV41_LEGACY_NAMES", {})
         missing = [n for n in others if not (folder / n).exists() and not (legacy.get(n) and (folder / legacy[n]).exists())]
         if missing:
-            parts = {4: "four", 9: "nine"}.get(len(others), str(len(others)))
-            raise LaunchError(f"DeepSeek-V4.1-Flash {d.get('label', model)} is in {parts} parts and {len(missing)} of them are not in {folder} "
+            parts = {3: "three", 4: "four", 9: "nine"}.get(len(others), str(len(others)))
+            raise LaunchError(f"{title} {d.get('label', model)} is in {parts} parts and {len(missing)} of them are not in {folder} "
                               f"(first missing: {missing[0]}).",
                               "Put every part in the folder (or drop --model-path and let Strata download them). "
                               "Nothing was downloaded or changed.", 5)
-        s.family, s.model, s.model_path = "deepseek41", model, str(folder)
-        self.emit("model", f"These files are DeepSeek-V4.1-Flash {model}; they are used where they are.", None)
+        s.family, s.model, s.model_path = family, model, str(folder)
+        self.emit("model", f"These files are {title} {model}; they are used where they are.", None)
         return True
 
     def check_own_files(self) -> None:
@@ -1327,6 +1329,9 @@ class Runner:
         if s.tune == "skip":
             return
         if self.multi_file():
+            if self.s.family == "deepseek4":       # no drafter to try and no V4.1 tuner: the measured settings are the standard ones
+                self.emit("tune", "DeepSeek-V4-Flash-0731 starts with the settings measured for it; there is nothing to tune yet.", 100)
+                return
             self.tune_deepseek()
             return
         from strata_control import presets
@@ -1865,7 +1870,7 @@ class Runner:
         """An installed DeepSeek model whose config names an engine that is gone (an older package folder an update removed, or another install's) while
         this install has no DeepSeek engine package either: not 'already installed' - setup runs, which fetches the package through the feed or says in
         one plain line what to do (--dsv41-package, or the engine-dsv41 folder), instead of the start failing on a missing file."""
-        if cfg.get("arch") != "deepseek41":
+        if cfg.get("arch") not in ("deepseek41", "deepseek4"):
             return False
         exe = str(cfg.get("exe") or "")
         if exe and Path(exe).is_file():
@@ -1876,7 +1881,7 @@ class Runner:
         """DeepSeek: the run config's engine is the DeepSeek engine package of THIS install (engine-dsv41/ here), not the path the installed model's
         config was written with: that config can come from another Strata install on this computer (the model is shared between installs) or name
         an older package folder that an update has replaced.  Only when this install has no package does the config's own path stay."""
-        if cfg.get("arch") != "deepseek41":
+        if cfg.get("arch") not in ("deepseek41", "deepseek4"):
             return
         found, _known = self.dsv41_engine_found()
         if found is None:

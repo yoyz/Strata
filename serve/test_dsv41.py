@@ -420,6 +420,20 @@ class Api(ApiBase):
         self.chat()
         self.assertEqual(self.engine.last_sampling.get("temperature"), 1.0)
 
+    def test_deepseek4_is_the_deepseek_family_too(self):
+        # same server text as V4.1 (DSML calls, end token, effort words), its own model name and card sampling
+        self.assertEqual(FAMILY_MODEL_NAMES["deepseek4"], "deepseek-v4-flash-0731")
+        self.assertEqual(default_model_name({"arch": "deepseek4"}), "deepseek-v4-flash-0731")
+        self.assertEqual(model_card_sampling("deepseek4", True), {"temperature": 1.0, "top_p": 1.0})
+        self.start("ok")
+        self.svc.set_family("deepseek4")
+        self.assertEqual(self.svc.stop_ids, {1})
+        self.assertIs(self.svc.parser_cls, DsmlOutputParser)
+        self.chat(reasoning_effort="max")
+        self.assertIn("Reasoning Effort: 100 ", self.prompt())
+        self.chat()
+        self.assertIn("Reasoning Effort: 75 ", self.prompt())
+
     # -- effort ------------------------------------------------------------------------------------
     def test_effort_words(self):
         self.start("ok")
@@ -609,6 +623,11 @@ class SlotEnv(unittest.TestCase):
         env = self.env({"arch": "deepseek41", "log": "x/y.log",
                         "env": {"STRATA_DS4_SLOT_KEEP": "1", "STRATA_DS4_SLOT_DIR": "elsewhere"}})
         self.assertEqual((env["STRATA_DS4_SLOT_KEEP"], env["STRATA_DS4_SLOT_DIR"]), ("1", "elsewhere"))
+
+    def test_deepseek4_gets_the_same_slot_settings(self):
+        env = self.env({"arch": "deepseek4", "log": str(Path("data") / "strata-deepseek.log")})
+        self.assertEqual(Path(env["STRATA_DS4_SLOT_DIR"]), Path("data") / "ds4-slots")
+        self.assertEqual((env["STRATA_DS4_SLOT_KEEP"], env["STRATA_DS4_SLOT_GB"]), ("1", "2"))
 
     def test_other_families_get_nothing(self):
         for arch in ("qwen4exp", None, "gyro"):
