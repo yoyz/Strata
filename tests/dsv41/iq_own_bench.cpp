@@ -142,6 +142,9 @@ int main(int argc, char** argv) {
     y0 = y;
     const double t_en = pass(true);
     const bool same = std::memcmp(y0.data(), y.data(), y.size() * 4) == 0;
+    // the bit-exact test on the whole pipeline: every down-row output of the two lanes, compared as raw float bits
+    std::printf("bit check: %zu down-row outputs (%d experts x %d token(s) x %d rows), engine default vs the rows: %s\n",
+                y.size(), ne, nt, E, same ? "identical" : "DIFFERENT");
     std::printf("engine default %.3f s = %.1f GB/s (%.3f ms an expert) | with the rows %.3f s = %.1f GB/s (%.3f ms an "
                 "expert) | x%.2f %s\n", t_gg, gb / t_gg, t_gg / ne * 1e3, t_en, gb / t_en, t_en / ne * 1e3, t_gg / t_en,
                 same ? "bit-identical" : "DIFFERENT BITS");

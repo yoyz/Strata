@@ -627,8 +627,13 @@ void own_rows(int type, const uint8_t* w, size_t rb, int n, const void* const* a
     (void) type, (void) w, (void) rb, (void) n, (void) act, (void) nt, (void) out, (void) r0, (void) r1;
 }
 
-// our rows against ggml-cpu's dot, bit for bit: random blocks of the type (its F16 scale a small normal value), Q8_K
-// activations from ggml's quantizer, 1, 2, 3, 5 and 9 tokens, 13 rows of 8 blocks
+// The bit-exact test every row of this file has to pass before the engine may use it: our rows against ggml-cpu's own
+// row dot, bit for bit - random blocks of the type (its F16 scale a small normal value, so the float steps are live),
+// Q8_K activations from ggml's quantizer, 1, 2, 3, 5 and 9 tokens, 13 rows of 8 blocks 2048 values long.  `got` is
+// ours (own_rows, the same entry point the engine calls), `ref` is ggml_get_type_traits_cpu(type)->vec_dot on the same
+// weights and activations - exactly what the CPU lane computes without us - and the two float arrays are compared with
+// std::memcmp, so one differing bit fails it.  own() runs it once per type (and once more with the second form on) and
+// keeps ours only if it passes; DS4_IQ_VERBOSE=1 prints the result.
 bool own_check(int type) {
     ggml_cpu_init();
     const ggml_type t = (ggml_type) type;
@@ -764,6 +769,11 @@ bool own(int type, int nt) {
             good_g = own_check(type);
             gflag[0] = gflag[1] = false;
         }
+        if (std::getenv("DS4_IQ_VERBOSE") != nullptr)   // the bit-exact test (own_check): pass = the same numbers as ggml
+            std::fprintf(stderr, "ds4: CPU lane %s rows: bit check against ggml-cpu's dot %s (13 rows x 8 blocks, 1/2/3/5/9 tokens%s)\n",
+                         ggml_type_name((ggml_type) type),
+                         good ? "PASSED" : "FAILED, ggml-cpu's rows stay",
+                         gflag != nullptr && good_g ? ", both forms" : "");
         if (mode == 1) {
             if (gflag != nullptr) gflag[0] = gflag[1] = force_gather && good_g;
             ok[k][0] = ok[k][1] = good || (force_gather && good_g);
