@@ -91,9 +91,14 @@ The tokenizer needed one fix found on the way: the GGUF says `joyai-llm`, which 
 sequence; `tools/strata_tokenizer.py` matched only names starting with `deepseek`, so it split with the Qwen
 pattern.  Its ids now match `llama-tokenize` on the real shard.
 
-1. Still missing for a stranger's PC: **a `strata-dsv41` package in the signed feed with this engine**.  The
-   packaging tools already take it (`packaging/package_engine.py --require-dsv41`); what is missing is the build,
-   the version and the feed entry.  Until then, setup finds no engine for this model unless a build is named:
+1. Still missing for a stranger's PC: **a `strata-dsv41` package in the signed feed with this engine**.
+   `packaging/build_dsv41_hip_linux.sh` is the Linux AMD recipe: it builds `strata-dsv41` alone, stages its ROCm
+   libraries and hipBLASLt tables, signs the manifest when `KEY=<feed-key.json>` is given, and writes the archive and
+   `.entry.json` for `feed_tool.py build-feed --dsv41`.  Built and validated on 2026-10-25 (0.1.50, rx9070,
+   gfx1200 + gfx1201, 346 MB, installed through `dsv41_engine.install_package` with a throwaway key, `env -i` runs,
+   the smoke question answers Paris).  What remains: the release key (offline), the CUDA / Windows twins (the same
+   three commands after `build_dsv41_cuda.sh` / `build_dsv41_windows.bat`) and publishing the feed.  Until then setup
+   finds no engine for this model on a stranger's PC unless one is named:
    `STRATA_DSV41_EXE=/path/to/build-dsv41/strata-dsv41` (or `--dsv41-package`).
 2. Then, in any order: the DSpark drafter (it offers 0 drafts - the drafter blocks need the same kind of port), the
    8K-context comparison against llama.cpp, and a shipped expert profile for this pack (the shipped

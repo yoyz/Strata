@@ -162,9 +162,30 @@ the comparison hooks for the validation step.
     (`src/llama-vocab.cpp`, the same list as `deepseek3`), and `tools/strata_tokenizer.py` matched only names
     starting with `deepseek`, so it split the text with the Qwen pattern.  Its ids now match `llama-tokenize` on
     the real shard for English, digits, CJK and punctuation.
-  - Left: a `strata-dsv41` package in the signed feed with this engine.  `packaging/package_engine.py
-    --require-dsv41` already takes it; until a package exists, setup finds no engine for `deepseek4` unless one is
-    named (`STRATA_DSV41_EXE` or `--dsv41-package`).
+  - Left: a `strata-dsv41` package in the signed feed with this engine.  The build recipe is
+    `packaging/build_dsv41_hip_linux.sh` (below); the release key that signs the manifest is kept offline, and the
+    CUDA / Windows twins still need their own package step.
+
+### The engine package (2026-10-25)
+
+`packaging/build_dsv41_hip_linux.sh` builds `strata-dsv41` alone (not beside the Qwen engine), puts it in its own
+component folder with the ROCm libraries it loads and the hipBLASLt tables of the archs it was built for, signs the
+manifest when `KEY=<feed-key.json>` is given, and writes the archive + `.entry.json` that
+`packaging/feed_tool.py build-feed --dsv41 <folder>` takes.  Measured on this box (RX 9070 XT, ROCm SDK in the
+Strata 0.1.40.3 venv, hipBLASLt 1.2.0, no table for it in `tools/hip`):
+
+| | |
+|---|---|
+| package | `strata-dsv41-0.1.50-linux-x86_64-hip-rx9070.tar.gz` (gfx1200 + gfx1201) |
+| size | 346 MB (362,820,357 bytes); 1157.9 MiB and 780 files unpacked |
+| build | 4.5 minutes on 12 jobs, `STRATA_PORTABLE=ON` and `STRATA_NATIVE_EXPERTS=ON` |
+| install | `strata_control.dsv41_engine.install_package` with a throwaway key: signature and every file checked, unpacked in `engine-dsv41/0.1.50-linux-x86_64-hip-rx9070` |
+| runs | `env -i .../strata-dsv41 --version` prints `strata-dsv41 0.1.50 build 57d47fb42`; the 16-token smoke question answers "The capital of France is Paris." |
+
+The release key is not on this machine, so the package made here is signed with a test key and cannot be installed by
+a PC that trusts the release key.  Signing (`feed_tool.py sign-package`) and publishing the feed remain the owner's
+steps.  The Qwen engine's package is built by `packaging/build_hip_linux.sh`, which still carries `strata-dsv41`
+beside `strata` for the V4.1 setup; the two are separate artifacts on purpose.
 
 ## The four bugs (item 4), and how each was found
 
@@ -315,12 +336,15 @@ values, `sigmoid(scale·mix + base) + eps`, weighted sum, then `output_norm` and
 the rest in place from the GGUF, and runs the model's own graph: the window, the compressed rows (each layer its own,
 from the two halves of its group and the position table), the ratio-4 layers' top-512 selection from the indexer's
 own compressed keys, every compressed row on the ratio-128 layers, hyper-connections per layer, MoE with top-k or the
-hash table, and the head with its hyper-connection. What is left is the real pack (item 3: layers 26 and 42 still
-carry the test pack's substituted down experts) and the comparison against llama.cpp (item 4). The compressors are
-checked against a double reference (`ds4_compress_test`); the indexer's selection is not checked yet.
+hash table, and the head with its hyper-connection. The compressors are checked against a double reference
+(`ds4_compress_test`); everything else is checked against llama.cpp, stage by stage (item 4). The pack is built by
+`pack_gguf.py` alone; `ds4_testpack.py` is history. What is left is the 8K-context comparison and an expert profile
+made for this pack.
 
 ## Cautions
 
-- The engine package for the feed (`strata-dsv41-…tar.gz`) does not exist for this model; this is a source build.
-- `strata launch`/`setup.py` do not know the model yet (item 5). They still serve V4.1 only.
-- The test rewrites change values, not shapes: never ship such a pack.
+- The `strata-dsv41` package for the signed feed is not published yet; `packaging/build_dsv41_hip_linux.sh` makes
+  the Linux AMD one (signed with a test key here), and the release key that makes it installable is offline.
+- `strata launch`/`setup.py` know the model (`--family deepseek4`), but a stranger's PC has no engine package to
+  download until the feed carries one; there it needs `STRATA_DSV41_EXE` or `--dsv41-package`.
+- The test rewrites change values, not shapes: never ship such a pack. `ds4_testpack.py` is kept only in the history.

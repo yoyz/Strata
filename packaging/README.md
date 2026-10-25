@@ -31,6 +31,36 @@ Windows installer must be produced on Windows. What *is* portable is
 everything below the carrier: the Python contracts, the owner transport, the checks, and the engine
 build recipes.
 
+## The DeepSeek engine package (feed member `dsv41`)
+
+DeepSeek's engine, `strata-dsv41`, is a package of its own: its manifest's entrypoint is `strata-dsv41`, and
+`strata_control/dsv41_engine.py` installs it under `<data>/engine-dsv41/`, beside and never inside the Qwen engine.
+The Qwen packages also carry `strata-dsv41` beside `strata` (a fresh install has an engine before the feed is
+reached); the two are separate artifacts.
+
+```sh
+# Linux AMD: build, stage, sign (KEY=<feed-key.json>; without it the package is unsigned) and pack the entry
+VARIANT=rx9070 SRC=$PWD LLAMA=<llama.cpp at the pinned commit> \
+  HP=<TheRock>/_rocm_sdk_devel CORE=<TheRock>/_rocm_sdk_core LIBW=<TheRock>/_rocm_sdk_libraries_gfx120X_all \
+  OUT=<work> PKGVER=0.1.50 KEY=<feed-key.json> packaging/build_dsv41_hip_linux.sh
+python3 packaging/feed_tool.py build-feed --out <feed> --key <feed-key.json> --sequence <n> --dsv41 <work>/dsv41
+```
+
+The NVIDIA builds start from `packaging/build_dsv41_cuda.sh` (or `build_dsv41_windows.bat` on Windows); the package
+step is the same three commands:
+
+```sh
+python3 packaging/package_engine.py --src <stage with strata-dsv41 + its libraries> --backend {cuda,hip} \
+  --version <the number the binary prints> --entrypoint strata-dsv41 --arch <arch>... [--variant <v>] --tree \
+  --out <components-dsv41>
+python3 packaging/feed_tool.py sign-package <components-dsv41>/<version>-<platform>-<backend>[-<variant>] --key <feed-key.json>
+python3 packaging/feed_tool.py pack-engine <that folder> --out <work>/dsv41 --prefix strata-dsv41 --url-prefix ""
+```
+
+A package is immutable: remove an existing folder before making it again. The manifest's signature covers every
+file hash, so signing is the last step before `pack-engine` (which records the signed manifest's SHA-256 in the
+entry).
+
 ## The private Node runtime
 
 The desktop bundle ships a pinned standalone Node beside the App Host, because the packaging
