@@ -89,9 +89,11 @@ int mx_tier();                   // the tier mx_rows takes (measured on first us
 const char* mx_tier_report();    // the measurement behind it (each candidate's time), or how it was picked
 bool mx_tier_ok(int t);          // this CPU runs tier t
 const char* mx_tier_name(int t);
-/// Whether the rows of `type` are ds4's own here (IQ3_XXS / IQ3_S on AVX2 / AVX-512 VBMI: ggml-cpu's numbers bit for
-/// bit, checked against its dot on first use; DS4_IQ_OWN=0 turns them off) rather than ggml's / the GLM lane's.
-bool iq_cpu_own_rows(int type);
+/// Whether the rows of `type` are ds4's own here for `nt` tokens (IQ3_XXS / IQ3_S on AVX2 / AVX-512 VBMI, IQ2_XXS /
+/// IQ2_S on AVX2: ggml-cpu's numbers bit for bit, checked against its dot on first use, then taken only where faster
+/// than the lane they replace - at one token that lane is ggml-cpu's dot, from two this build's own multi-token rows;
+/// DS4_IQ_OWN=0 turns them off, =1 turns them on without measuring) rather than the lane the engine would run.
+bool iq_cpu_own_rows(int type, int nt = 1);
 
 /// x rounded as the device's MXFP4 kernels round their activations (q8_quant: per 32 values sc = max|x| / 127, q =
 /// round-half-even(x / sc), the same F32 operations, so the same q), into out as q sc - an expert gives the same sums

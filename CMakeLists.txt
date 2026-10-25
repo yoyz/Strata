@@ -841,6 +841,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                                  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
       target_link_libraries(ds4_gg_bench PRIVATE strata_kernels_cpu Threads::Threads)
       target_compile_definitions(ds4_gg_bench PRIVATE STRATA_DSV41_TQ_CPU=1)
+      # the decode lane's i-quant rows (ds4_iq_cpu.cpp own()) against this build's native lane, an expert by an expert
+      # at 1 token; no GPU, no model (tests/dsv41/iq_own_bench.cpp)
+      add_executable(ds4_iq_own_bench tests/dsv41/iq_own_bench.cpp src/dsv41/ds4_iq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp
+                     src/dsv41/ds4_tq_cpu.cpp)
+      target_include_directories(ds4_iq_own_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
+      target_link_libraries(ds4_iq_own_bench PRIVATE strata_kernels_cpu Threads::Threads)
+      target_compile_definitions(ds4_iq_own_bench PRIVATE STRATA_DSV41_TQ_CPU=1)
     endif()
     if(STRATA_NATIVE_EXPERTS)
       # the trellis experts (device kernels ds4_tq.cu, CPU lane ds4_tq_cpu.cpp) against a double reference; needs a GPU, no model
