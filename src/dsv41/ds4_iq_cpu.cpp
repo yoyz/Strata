@@ -422,6 +422,16 @@ IQ_AVX2 void iq_rows_avx2(const uint8_t* w, size_t rb, int nb, const block_q8_K*
 // 64 values' 16 codes spread to their bytes by a word permute, a multishift, an and and a byte shuffle; IQ3_XXS's signs
 // come from pdep and a parity fold, IQ3_S's are a mask register's bits.  Two chunks a register, folded to ggml's 8
 // lanes, then ggml's float steps: the same numbers to the bit (own_check).
+//
+// Status 2026-10-25: written, compiled and gated (rows_512 needs AVX-512 F + BW + VBMI and BMI2, and the OS saving the
+// ZMM state), and own_check runs it before any use, bit for bit against ggml-cpu's dot - but it has never been executed
+// on AVX-512 hardware from this tree: the machines here are AVX2 only (this 3900X, Zen 2), so its speed is unmeasured.
+// The Zen 4 / Zen 5 numbers quoted in ds4_gg_cpu.cpp belong to the GLM lane's iq512x_rows, not to these.  On an AVX-512
+// CPU an agent can unlock and settle it without touching this file: DS4_IQ_VERBOSE=1 ds4_iq_own_bench --nt 1|4
+// --experts 48 prints the tier (512-bit) and both measurements, DS4_IQ_512=1 forces these rows and =0 the AVX2 ones, and
+// the engine A/B (--vram-experts 0 --ssd-cache 96, 256 tokens, 3 runs each, DS4_IQ_OWN=0 against 1) says what a decode
+// gains.  If they win by the 10 % margin, own() takes them by itself on that CPU; if they lose, DS4_IQ_512=0 is the
+// answer to record there.  Nothing below needs changing either way.
 #if defined(__GNUC__) || defined(__clang__)
 #define IQ_512 __attribute__((target("avx512f,avx512bw,avx512vbmi,bmi2,avx2,fma")))
 #else
@@ -571,7 +581,8 @@ IQ_512 void iq3_rows_512(const uint8_t* w, size_t rb, int nb, const block_q8_K* 
 }
 
 // the 512-bit rows (iq3_rows_512): IQ3_XXS / IQ3_S on a CPU with AVX-512 F/BW/VBMI, where the codes build (g_codes_ok).
-// DS4_IQ_512=0 never takes them, =1 always where the CPU has them (to compare); unset: automatic.
+// DS4_IQ_512=0 never takes them, =1 always where the CPU has them (to compare); unset: automatic.  Their speed is
+// unmeasured - no AVX-512 machine has run them from this tree; the note over iq3_rows_512 says how to settle it.
 bool rows_512(int type) {
     static const bool ok = [] {
         const char* a2 = std::getenv("DS4_IQ_AVX2");   // (=1: the AVX2 rows on an AVX-512 CPU too, to compare)
