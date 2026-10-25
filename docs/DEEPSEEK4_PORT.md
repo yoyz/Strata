@@ -146,6 +146,15 @@ the comparison hooks for the validation step.
 - [x] **4. Validation against llama.cpp.** Done for the token path: four bugs found, each measured, and the model
   now answers and matches llama.cpp (see "The four bugs" below).  *Left: the same comparison at 8K context, and the
   speed with an expert profile made for this pack.*
+  - The engine's 8K side is measured (2026-10-25, commit `57d47fb4`): the 8,192-token prefix of a docs text, which
+    `llama-tokenize` and the pack's tokenizer split into the same ids, read through the chunk path in 62 s
+    (**131.4 tokens/s**) with `--max-context 8192 --window 8192`, and its 43 residual records are dumped.  The
+    llama.cpp reference at the same prompt was not run: `llama-perplexity` needs 2x the context in tokens, and
+    `llama-eval-callback` wants 6.4 GB of video memory for the dense part - the card was in use by another
+    benchmark at the time.  Run it on an idle box with
+    `llama-eval-callback -f <the same 8192-token file> -c 8192 -ngl 999 -ot "blk\.[0-9]+\.ffn_(gate|up|down)_exps\.weight=CPU" -t 12`
+    (experts on the CPU keep the model inside 16 GB) and compare the last token's `l_last-N` with the engine's
+    `DS4_DUMP_L` records at position 8,191.
   - Then: 8K context, then speed with an expert profile (`tools/dsv41` has the profile tools; the shipped
     `profile-2.00.bin` is for the IST-DAS sets, not this model).
 
