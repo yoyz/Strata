@@ -14,14 +14,14 @@ or an Apple Silicon Mac. Version 0.2.3, engine 0.1.48. It has three parts:
 
 ## Where this checkout stands (2026-10-25)
 
-This checkout is the 0.2.4 tag with one evening of DeepSeek-V4.1 work on branch `f-dsv41-iq-own-rows`. Read
-**[AGENTS_run.md](AGENTS_run.md)** (same folder) before anything else: it is the run book - what is built, how to start
-DeepSeek, every measurement with the machine it was taken on, and what is open, item by item.
+This folder is the 0.2.4 tag; the DeepSeek-V4-Flash-0731 port is branch `f-deepseek-v4-flash-0731`, in the
+`f-dsv41-ds4` worktree. Read **[AGENTS_run.md](AGENTS_run.md)** (same folder) before anything else: it is the run book -
+what is built, how to start DeepSeek, every measurement with the machine it was taken on, and what is open, item by item.
 
 - **DeepSeek-V4-Flash-0731 serves on 8090**, started by `./run-deepseek-v4-flash-0731-ud-iq2_xxs.sh` (or the same
   `serve/server.py` without `--open`). The engine is
   `/mnt/nvme_lexar_0/ollama_user_cache/strata/build-dsv41/strata-dsv41`, 0.1.50 build `4850944e3`, built from the
-  `f-dsv41-ds4` worktree on branch `f-dsv41-iq-own-rows-wt`. **This checkout cannot run that model** - its packer and
+  `f-dsv41-ds4` worktree on that branch. **This folder cannot run that model** - its packer and
   loader predate the Unsloth `deepseek4` files - so the dsv41 engine code lives and is built in that worktree. Stop the
   server with SIGTERM (a clean stop writes `expert-profile.bin`), and do not relink the engine while it runs.
 - **The IQ CPU rows are ported and measured**: `src/dsv41/ds4_iq_cpu.cpp`'s tuned rows (Maya's, behind a shim over this
@@ -38,8 +38,8 @@ DeepSeek, every measurement with the machine it was taken on, and what is open, 
 - **A/B on this box**: `--vram-experts 0 --ssd-cache 96`, 256 tokens, 3 runs each (spread under 1 %). The store's size
   alone is worth about 10 %: 10.80 tok/s at 48 GB against 11.6-12.0 at 96 GB. Another session may be working in the same
   worktree - check `git status` and `ps` there before building, and never kill a run you did not start.
-- The commits of this work are listed in AGENTS_run.md's experiment rows; on this branch they are the IQ rows port, the
-  bit check's message and its status note, and this page.
+- The commits of this work are listed in AGENTS_run.md's experiment rows; on `f-deepseek-v4-flash-0731` they are the
+  whole port, from its first track to the IQ rows, and this page.
 
 ## Installing Strata for a user
 
